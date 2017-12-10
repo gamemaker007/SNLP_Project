@@ -61,7 +61,7 @@ objective = 'span_multinomial'  # 'span_multinomial': multinomial distribution o
 # 'span_binary':      logistic distribution per span
 # 'span_endpoints':   two multinomial distributions, over span start and end
 ablation = None
-log_file_name = 'testingLog'
+log_file_name = 'testingLog2'
 
 
 logging.basicConfig(filename=log_file_name,level=logging.DEBUG)
@@ -248,36 +248,37 @@ def _make_vectorized_dataset(tabular, word_emb_data):
     max_ctx_len = max(len(ctx.tokenized.tokens) for ctx in tabular.ctxs)
     max_qtn_len = max(len(qtn.tokenized.tokens) for qtn in tabular.qtns)
 
-    all_ctxs = np.zeros((num_ctxs, max_ctx_len), dtype=np.int32)
-    all_ctx_lens = np.zeros(num_ctxs, dtype=np.int32)
-    qtns = np.zeros((num_qtns, max_qtn_len), dtype=np.int32)
-    qtn_lens = np.zeros(num_qtns, dtype=np.int32)
-    qtn_ctx_idxs = np.zeros(num_qtns, dtype=np.int32)
-
-    qtn_ctx = np.zeros((num_qtns, max_ctx_len), dtype=np.int32)
-    qtn_ctx_lens = np.zeros(num_qtns, dtype=np.int32)
-    qtn_ans_inds = np.zeros(num_qtns, dtype=np.int32)
-    anss = np.zeros((num_qtns, 2), dtype=np.int32)
+    all_ctxs = torch.zeros(num_ctxs, max_ctx_len).long()
+    all_ctx_lens = torch.zeros(num_ctxs, ).long()
+    qtns = torch.zeros(num_qtns, max_qtn_len).long()
+    qtn_lens = torch.zeros(num_qtns, ).long()
+    qtn_ctx_idxs = torch.zeros(num_qtns, ).long()
+    
+    qtn_ctx = torch.zeros(num_qtns, max_ctx_len).long()
+    qtn_ctx_lens = torch.zeros(num_qtns, ).long()
+    qtn_ans_inds = torch.zeros(num_qtns, ).long()
+    anss = torch.zeros(num_qtns, 2).long()
 
     for ctx_idx, ctx in enumerate(tabular.ctxs):
         ctx_words = [word_emb_data.str_to_word[word_str] for word_str in ctx.tokenized.tokens]
-        all_ctxs[ctx_idx, :len(ctx_words)] = ctx_words
+        all_ctxs[ctx_idx, :len(ctx_words)] =  torch.Tensor(ctx_words).long()
         all_ctx_lens[ctx_idx] = len(ctx_words)
 
+    
     for qtn_idx, qtn in enumerate(tabular.qtns):
         qtn_words = [word_emb_data.str_to_word[word_str] for word_str in qtn.tokenized.tokens]
-        qtns[qtn_idx, :len(qtn_words)] = qtn_words
+        qtns[qtn_idx, :len(qtn_words)] = torch.Tensor(qtn_words).long()
         qtn_lens[qtn_idx] = len(qtn_words)
         qtn_ctx[qtn_idx] = all_ctxs[qtn.ctx_idx]
         qtn_ctx_lens[qtn_idx] = all_ctx_lens[qtn.ctx_idx]
         ans = next((ans for ans in qtn.ans_word_idxs if ans), None) if qtn.ans_word_idxs else None
         if ans:
             ans_start_word_idx, ans_end_word_idx = ans
-            anss[qtn_idx] = [ans_start_word_idx, ans_end_word_idx]
+            anss[qtn_idx] = torch.Tensor([ans_start_word_idx, ans_end_word_idx]).long()
             qtn_ans_inds[qtn_idx] = 1
         else:
             qtn_ans_inds[qtn_idx] = 0
-
+        
     return SquadDatasetVectorized(qtn_ctx, qtn_ctx_lens, qtns, qtn_lens, anss)
 
 class DatasetLoader(Dataset):
@@ -306,7 +307,7 @@ def prepare_data(batch):
     qtns = []
     qtn_lens = []
     anss = []
-
+    
     for datum in batch:
         ctxs.append(datum[0])
         ctx_lens.append(datum[1])
@@ -317,15 +318,25 @@ def prepare_data(batch):
     max_question_length = int(max(qtn_lens))
     max_ctx_length = int(max(ctx_lens))
     n_samples = len(qtns)
-
+    
     contexts = torch.zeros(max_ctx_length, n_samples).long()
     contexts_mask = torch.zeros(max_ctx_length, n_samples)
-    contexts_lens = torch.zeros(n_samples, ).long()
-
+    contexts_lens = torch.zeros(n_samples,).long()
+    
     questions = torch.zeros(max_question_length, n_samples).long()
     questions_mask = torch.zeros(max_question_length, n_samples)
     final_answers = torch.zeros(n_samples, 2).long()
-    final_y = torch.zeros(n_samples, ).long()
+    final_y = torch.zeros(n_samples,).long()
+        
+        
+    for idx, [ctx, ctx_len, qtn, qtn_len, ans] in enumerate(zip(ctxs, ctx_lens, qtns, qtn_lens, anss)):       
+            contexts[:ctx_len, idx] = ctx[:ctx_len]
+            questions[:qtn_len, idx] = qtn[:qtn_len]
+            contexts_mask[:ctx_len, idx] = 1.
+            questions_mask[:qtn_len, idx] = 1.
+            final_answers[idx] = ans
+            contexts_lens[idx] = int(ctx_len)
+            final_y[idx] = int(_np_ans_word_idxs_to_ans_idx(ans[0], ans[1], max_ans_len))
 
     if can_use_gpu:
         contexts = contexts.cuda()
@@ -335,26 +346,7 @@ def prepare_data(batch):
         questions_mask = questions_mask.cuda()
         final_answers = final_answers.cuda()
         final_y = final_y.cuda()
-
-    for idx, [ctx, ctx_len, qtn, qtn_len, ans] in enumerate(zip(ctxs, ctx_lens, qtns, qtn_lens, anss)):
-        if can_use_gpu:
-            contexts[:ctx_len, idx] = torch.from_numpy(ctx[:ctx_len]).long().cuda()
-            questions[:qtn_len, idx] = torch.from_numpy(qtn[:qtn_len]).long().cuda()
-            contexts_mask[:ctx_len, idx] = 1.
-            questions_mask[:qtn_len, idx] = 1.
-            final_answers[idx] = torch.from_numpy(ans).cuda()
-            contexts_lens[idx] = int(ctx_len)
-            final_y[idx] = int(_np_ans_word_idxs_to_ans_idx(ans[0], ans[1], max_ans_len))
-
-        else:
-            contexts[:ctx_len, idx] = torch.from_numpy(ctx[:ctx_len]).long()
-            questions[:qtn_len, idx] = torch.from_numpy(qtn[:qtn_len]).long()
-            contexts_mask[:ctx_len, idx] = 1.
-            questions_mask[:qtn_len, idx] = 1.
-            final_answers[idx] = torch.from_numpy(ans)
-            contexts_lens[idx] = int(ctx_len)
-            final_y[idx] = int(_np_ans_word_idxs_to_ans_idx(ans[0], ans[1], max_ans_len))
-
+        
     return contexts, contexts_mask, questions, questions_mask, final_answers, contexts_lens, final_y
 
 
@@ -466,28 +458,29 @@ class QAModel(nn.Module):
         super(QAModel, self).__init__()
         self.LSTM1 = LSTM(emb_dim, hidden_dim)
         self.LSTM1_rev = LSTM(emb_dim, hidden_dim)
-
-        self.LSTM2 = LSTM(2 * hidden_dim, hidden_dim)
-        self.LSTM2_rev = LSTM(2 * hidden_dim, hidden_dim)
-
+        
+        self.LSTM2 = LSTM(2*hidden_dim, hidden_dim)
+        self.LSTM2_rev = LSTM(2*hidden_dim, hidden_dim)
+        
         self.ff_dims = 100
-        self.p_start_dim = emb_dim + 2 * hidden_dim + emb_dim
-
+        self.p_start_dim = emb_dim + 2 * hidden_dim +emb_dim
+        
         self.p_LSTM1 = LSTM(self.p_start_dim, hidden_dim)
         self.p_LSTM1_rev = LSTM(self.p_start_dim, hidden_dim)
-
-        self.p_LSTM2 = LSTM(2 * hidden_dim, hidden_dim)
-        self.p_LSTM2_rev = LSTM(2 * hidden_dim, hidden_dim)
-
+        
+        self.p_LSTM2 = LSTM(2*hidden_dim, hidden_dim)
+        self.p_LSTM2_rev = LSTM(2*hidden_dim, hidden_dim)
+        
         self.word_emb = word_emb
-
-        self.linear1 = nn.Linear(2 * hidden_dim, self.ff_dims)
-        self.linear_w = nn.Linear(self.ff_dims, 1, bias=False)
-        self.linear_q_aligned = nn.Linear(emb_dim, self.ff_dims, bias=False)
-        self.linear_ans_start = nn.Linear(2 * hidden_dim, self.ff_dims)
-        self.linear_ans_end = nn.Linear(2 * hidden_dim, self.ff_dims, bias=False)
-        self.linear_span = nn.Linear(self.ff_dims, 1, bias=False)
-
+        
+        
+        self.linear1 = nn.Linear(2*hidden_dim, self.ff_dims)
+        self.linear_w = nn.Linear(self.ff_dims, 1, bias = False)
+        self.linear_q_aligned = nn.Linear(emb_dim, self.ff_dims)
+        self.linear_ans_start = nn.Linear(2*hidden_dim, self.ff_dims)
+        self.linear_ans_end = nn.Linear(2*hidden_dim, self.ff_dims)
+        self.linear_span = nn.Linear(self.ff_dims, 1, bias = False)
+        
         if can_use_gpu:
             self.linear1 = self.linear1.cuda()
             self.linear_w = self.linear_w.cuda()
@@ -495,29 +488,26 @@ class QAModel(nn.Module):
             self.linear_ans_start = self.linear_ans_start.cuda()
             self.linear_ans_end = self.linear_ans_end.cuda()
             self.linear_span = self.linear_span.cuda()
-
+            
         self.init_weights()
-
+        
     def forward(self, contexts, contexts_mask, questions, questions_mask, anss, contexts_lens):
         n_timesteps_cntx = contexts.size(0)
         n_timesteps_quest = questions.size(0)
         n_samples = contexts.size(1)
-
+        
         emb_cntx = self.word_emb[contexts.view(-1)].view(n_timesteps_cntx, n_samples, emb_dim)
         emb_quest = self.word_emb[questions.view(-1)].view(n_timesteps_quest, n_samples, emb_dim)
-
+        
         q_indep = self.compute_q_indep(emb_quest, questions_mask, emb_cntx.size(0))
-        q_align = self.compute_q_aligned(emb_cntx, emb_quest, contexts_mask, questions_mask)
+        q_align = self.compute_q_aligned(emb_cntx,emb_quest,contexts_mask,questions_mask)
+        p_star = torch.cat((emb_cntx,q_indep,q_align),2)
 
-        p_star = torch.cat((emb_cntx, q_indep, q_align), 2)
-
-        passage_level = self.sequence_encoder(p_star, contexts_mask, self.p_LSTM1, self.p_LSTM1_rev, self.p_LSTM2,
-                                              self.p_LSTM2_rev)
-
-        loss, acc, sum_acc, sum_loss = self.compute_answer(passage_level[2], passage_level[2], contexts_lens,
-                                                           batch_size, anss)
+        passage_level = self.sequence_encoder(p_star, contexts_mask, self.p_LSTM1, self.p_LSTM1_rev, self.p_LSTM2, self.p_LSTM2_rev)
+        loss, acc, sum_acc, sum_loss = self.compute_answer(passage_level[2], passage_level[2], contexts_lens, n_samples, anss)
         return loss, acc, sum_acc, sum_loss
-
+        
+    
     def sequence_encoder(self, inp, mask, lstm1, lstm_rev1, lstm2, lstm_rev2):
         reverse_emb = self.reverseTensor(inp)
         reverse_mask = self.reverseTensor(mask)
@@ -525,48 +515,49 @@ class QAModel(nn.Module):
         #  LSTM1
         seq1 = lstm1(inp, mask)
         seq_reverse1 = lstm_rev1(reverse_emb, reverse_mask)
-
+        
         inp_seq2 = torch.cat((seq1[0], self.reverseTensor(seq_reverse1[0])), len(seq1[0].size()) - 1)
         reverse_inp_seq2 = self.reverseTensor(inp_seq2)
 
         #  LSTM2
         seq2 = lstm2(inp_seq2, mask)
         seq_reverse2 = lstm_rev2(reverse_inp_seq2, reverse_mask)
-
+        
         cat_seq2 = torch.cat((seq2[0], self.reverseTensor(seq_reverse2[0])), len(seq2[0].size()) - 1)
         return seq2, seq_reverse2, cat_seq2
-
+    
+        
     def compute_q_indep(self, q_emb, q_mask, max_p_len):
         encoder_out = self.sequence_encoder(q_emb, q_mask, self.LSTM1, self.LSTM1_rev, self.LSTM2, self.LSTM2_rev)
         q_indep_h = encoder_out[2]
-        q_indep_ff = self.linear1(q_indep_h)
+        q_indep_ff = F.relu(self.linear1(q_indep_h))
         q_indep_scores = self.linear_w(q_indep_ff)
-
+        
         q_indep_weights = self.softmax_columns_with_mask(q_indep_scores.squeeze(), q_mask)  # (max_q_len, batch_size)
         q_indep = torch.sum(q_indep_weights.unsqueeze(2) * q_indep_h, dim=0)  # (batch_size, 2*hidden_dim)
 
         q_indep_repeated = torch.cat([q_indep.unsqueeze(0)] * max_p_len)
-
+        
         return q_indep_repeated
-
+    
     def compute_q_aligned(self, p_emb, q_emb, p_mask, q_mask):
-        q_align_ff_p = self.linear_q_aligned(p_emb)
-        q_align_ff_q = self.linear_q_aligned(q_emb)
-
+        q_align_ff_p = F.relu(self.linear_q_aligned(p_emb))
+        q_align_ff_q = F.relu(self.linear_q_aligned(q_emb))
+        
         q_align_ff_p_shuffled = q_align_ff_p.permute(1, 0, 2)  # (batch_size, max_p_len, ff_dim)
         q_align_ff_q_shuffled = q_align_ff_q.permute(1, 2, 0)
-        q_align_scores = torch.bmm(q_align_ff_p_shuffled, q_align_ff_q_shuffled)
-
+        q_align_scores = torch.bmm(q_align_ff_p_shuffled,q_align_ff_q_shuffled)
+        
         p_mask_shuffled = p_mask.unsqueeze(2).permute(1, 0, 2)
         q_mask_shuffled = q_mask.unsqueeze(2).permute(1, 2, 0)
         pq_mask = torch.bmm(p_mask_shuffled, q_mask_shuffled)
-
-        q_align_weights = self.softmax_depths_with_mask(q_align_scores, pq_mask)
+        
+        q_align_weights = self.softmax_depths_with_mask(q_align_scores, pq_mask) 
         q_emb_shuffled = q_emb.permute(1, 0, 2)
         q_align = torch.bmm(q_align_weights, q_emb_shuffled)
         q_align_shuffled = q_align.permute(1, 0, 2)
         return q_align_shuffled
-
+        
     def reverseTensor(self, tensor):
         idx = [i for i in range(tensor.size(0) - 1, -1, -1)]
         if torch.cuda.is_available():
@@ -575,13 +566,14 @@ class QAModel(nn.Module):
             idx = Variable(torch.LongTensor(idx))
         inverted_tensor = tensor.index_select(0, idx)
         return inverted_tensor
-
-    def compute_answer(self, p_level_h_for_stt, p_level_h_for_end, p_lens, batch_size, anss):
+    
+    def compute_answer(self,p_level_h_for_stt, p_level_h_for_end, p_lens, batch_size, anss):
         max_p_len = p_level_h_for_stt.size(0)
-        p_stt_lin = self.linear_ans_start(p_level_h_for_stt)
-        p_end_lin = self.linear_ans_end(p_level_h_for_end)
-        span_lin_reshaped, span_masks_reshaped = self._span_sums(p_stt_lin, p_end_lin, p_lens, max_p_len, batch_size,
-                                                                 self.ff_dims, max_ans_len)
+        p_stt_lin =self.linear_ans_start(p_level_h_for_stt)
+        
+        p_end_lin =self.linear_ans_end(p_level_h_for_end)
+        
+        span_lin_reshaped, span_masks_reshaped = self._span_sums(p_stt_lin, p_end_lin, p_lens, max_p_len, batch_size, self.ff_dims, max_ans_len)
         span_ff_reshaped = F.relu(span_lin_reshaped)  # (batch_size, max_p_len*max_ans_len, ff_dim)
         span_scores_reshaped = self.linear_span(span_ff_reshaped).squeeze()
         xents, accs, a_hats = self._span_multinomial_classification(span_scores_reshaped, span_masks_reshaped, anss)
@@ -590,15 +582,15 @@ class QAModel(nn.Module):
         sum_acc = accs.sum()
         sum_loss = loss.sum()
         return loss, acc, sum_acc, sum_loss
-
+        
     def softmax_columns_with_mask(self, x, mask, allow_none=False):
         assert len(x.size()) == 2
         assert len(mask.size()) == 2
         # for numerical stability
 
-        x = x * mask
+        x = x*mask
         x = x - x.min(dim=0, keepdim=True)[0]
-        x = x * mask
+        x = x*mask
         x = x - x.max(dim=0, keepdim=True)[0]
         e_x = mask * torch.exp(x)
         sums = e_x.sum(dim=0, keepdim=True)
@@ -606,7 +598,7 @@ class QAModel(nn.Module):
             sums += torch.eq(sums, 0)
         y = e_x / sums
         return y
-
+    
     def _span_multinomial_classification(self, x, x_mask, y):
         # x       float32 (batch_size, num_classes)   scores i.e. logits
         # x_mask  int32   (batch_size, num_classes)   score masks (each sample has a variable number of classes)
@@ -620,7 +612,6 @@ class QAModel(nn.Module):
         x = x * x_mask  # (batch_size, num_classes)
         y_hats = x.max(dim=1)[1]  # (batch_size,)
         accs = torch.eq(y_hats.long(), y.long()).float()  # (batch_size,)
-
         x = x - x.max(dim=1, keepdim=True)[0]  # (batch_size, num_classes)
         x = x * x_mask  # (batch_size, num_classes)
         exp_x = torch.exp(x)  # (batch_size, num_classes)
@@ -628,16 +619,16 @@ class QAModel(nn.Module):
 
         sum_exp_x = exp_x.sum(dim=1)  # (batch_size,)
         log_sum_exp_x = torch.log(sum_exp_x)  # (batch_size,)
-        index1 = torch.arange(0, x.size(0)).long()
+        index1 = torch.arange(0,x.size(0)).long()
         if can_use_gpu:
             index1 = index1.cuda()
         x_star = x[index1, y.data]  # (batch_size,)
         xents = log_sum_exp_x - x_star  # (batch_size,)
         return xents, accs, y_hats
-
+    
     def _span_sums(self, stt, end, p_lens, max_p_len, batch_size, dim, max_ans_len):
-        max_ans_len_range = torch.arange(0, max_ans_len).unsqueeze(0)  # (1, max_ans_len)
-        offsets = torch.arange(0, max_p_len).unsqueeze(1)  # (max_p_len, 1)
+        max_ans_len_range = torch.arange(0,max_ans_len).unsqueeze(0)  # (1, max_ans_len)
+        offsets = torch.arange(0,max_p_len).unsqueeze(1)  # (max_p_len, 1)
         if can_use_gpu:
             max_ans_len_range = max_ans_len_range.cuda()
             offsets = offsets.cuda()
@@ -647,17 +638,16 @@ class QAModel(nn.Module):
         extra_zeros = torch.zeros(max_ans_len - 1, batch_size, dim)
         if can_use_gpu:
             extra_zeros = extra_zeros.cuda()
-        end_padded = torch.cat([end, Variable(extra_zeros)], 0)  # (max_p_len+max_ans_len-1, batch_size, dim)
-
+        #print(end.size(), extra_zeros.size())
+        end_padded = torch.cat([end, Variable(extra_zeros)], 0)# (max_p_len+max_ans_len-1, batch_size, dim)
+        
         end_structured = end_padded[end_idxs_flat]  # (max_p_len*max_ans_len, batch_size, dim)
-
-        end_structured = end_structured.view(max_p_len, max_ans_len, batch_size,
-                                             dim)  # (max_p_len, max_ans_len, batch_size, dim)
+        
+        end_structured = end_structured.view(max_p_len, max_ans_len, batch_size, dim)  # (max_p_len, max_ans_len, batch_size, dim)
         stt_shuffled = stt.unsqueeze(3).permute(0, 3, 1, 2)  # (max_p_len, 1, batch_size, dim)
 
         span_sums = stt_shuffled + end_structured  # (max_p_len, max_ans_len, batch_size, dim)
-        span_sums_reshaped = span_sums.permute(2, 0, 1, 3).contiguous().view(batch_size, max_p_len * max_ans_len,
-                                                                             dim)  # (batch_size, max_p_len*max_ans_len, dim)
+        span_sums_reshaped = span_sums.permute(2, 0, 1, 3).contiguous().view(batch_size, max_p_len * max_ans_len, dim) # (batch_size, max_p_len*max_ans_len, dim)
 
         p_lens_shuffled = p_lens.unsqueeze(1)  # (batch_size, 1)
         end_idxs_flat_shuffled = end_idxs_flat.unsqueeze(0)  # (1, max_p_len*max_ans_len)
@@ -667,31 +657,32 @@ class QAModel(nn.Module):
 
         # (batch_size, max_p_len*max_ans_len, dim), (batch_size, max_p_len*max_ans_len)
         return span_sums_reshaped, span_masks_reshaped
-
-    def softmax_depths_with_mask(self, x, mask):
+    
+    def softmax_depths_with_mask(self,x, mask):
         assert len(x.size()) == 3
         assert len(mask.size()) == 3
         # for numerical stability
-        x = x * mask
+        x = x*mask
         x = x - x.min(dim=2, keepdim=True)[0]
-        x = x * mask
+        x = x*mask
         x = x - x.max(dim=2, keepdim=True)[0]
         e_x = mask * torch.exp(x)
         sums = e_x.sum(dim=2, keepdim=True)
         y = e_x / (sums + (torch.eq(sums, 0).float()))
-        y = y * mask
+        y = y*mask
         return y
-
+    
     def init_weights(self):
         initrange = 0.1
-        with_bias = [self.linear1, self.linear_ans_start]
-        without_bias = [self.linear_w, self.linear_q_aligned, self.linear_ans_end, self.linear_span]
+        with_bias = [self.linear1, self.linear_ans_start, self.linear_q_aligned, self.linear_ans_end]
+        without_bias = [self.linear_w, self.linear_span]
 
         for layer in with_bias:
             layer.weight.data.uniform_(-initrange, initrange)
             layer.bias.data.fill_(0)
         for layer in without_bias:
             layer.weight.data.uniform_(-initrange, initrange)
+
 
 
 model = QAModel(word_emb,emb_dim, hidden_dim)
@@ -734,10 +725,8 @@ for epoch in range(max_num_epochs):
 
     current_epoch_train_loss = loss_curr_epoch / n_done
     current_epoch_train_acc = acc_curr_epoch / n_done
-    epoch_msg = 'End of Epoch' + (
-    epoch + 1) + '. Training Accuracy %= ', current_epoch_train_acc * 100, ' --  Loss = ', current_epoch_train_loss
-    print(epoch_msg)
-    logger.info(epoch_msg)
-    train_loss_hist.append(current_epoch_train_loss)
-    train_acc_hist.append(current_epoch_train_acc)
+    print(str.format('End of Epoch {0}. Training Accuracy %= {1},  --  Loss = {2}', (epoch+1), current_epoch_train_acc.data[0]*100, current_epoch_train_loss.data[0]))
+    logger.info(str.format('End of Epoch {0}. Training Accuracy %= {1},  --  Loss = {2}', (epoch+1), current_epoch_train_acc.data[0]*100, current_epoch_train_loss.data[0]))
+    train_loss_hist.append(current_epoch_train_loss.data[0])
+    train_acc_hist.append(current_epoch_train_acc.data[0]*100)
 
