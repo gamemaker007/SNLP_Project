@@ -4,7 +4,7 @@ import random
 from torch.utils.data import Dataset
 from collections import namedtuple
 from collections import Counter
-import io
+import io,sys
 import json
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.autograd import Variable
 import logging
+from typing import Dict, List, Optional, Any, Tuple, Callable
 
 metadata_path = "data/preprocessed_glove.metadata.pkl"
 emb_path = "data/preprocessed_glove.emb.npy"
@@ -36,7 +37,7 @@ lr_decay_freq = 5000  # frequency with which to decay learning rate, measured in
 max_grad_norm = 10  # gradient clipping
 ff_dims = [100]  # dimensions of hidden FF layers
 ff_drop_x = 0.2  # dropout rate of FF layers
-batch_size = 32
+batch_size = 2
 max_num_epochs = 150  # max number of epochs to train for
 num_bilstm_layers = 2  # number of BiLSTM layers, where BiLSTM is applied
 hidden_dim = 100  # dimension of hidden state of each uni-directional LSTM
@@ -62,6 +63,7 @@ objective = 'span_multinomial'  # 'span_multinomial': multinomial distribution o
 # 'span_endpoints':   two multinomial distributions, over span start and end
 ablation = None
 log_file_name = 'testingLog'
+
 
 
 logging.basicConfig(filename=log_file_name,level=logging.DEBUG)
@@ -130,9 +132,12 @@ class SquadDatasetTabular(object):
 def read_word_emb_data():
 	with open(metadata_path, 'rb') as f:
 		str_to_word, first_known_word, first_unknown_word, first_unallocated_word = pkl.load(f)
+	
 	with open(emb_path, 'rb') as f:
 		word_emb = np.load(f)
+	
 	word_emb_data = WordEmbData(word_emb, str_to_word, first_known_word, first_unknown_word, first_unallocated_word)
+	
 	return word_emb_data
 
 
@@ -360,7 +365,7 @@ def prepare_data(batch):
 			questions_mask[idx,:qtn_len] = 1.
 			final_answers[idx] = torch.from_numpy(ans)
 			contexts_lens[idx] = int(ctx_len)
-			questions_lens[idx] = int(qtx_len)
+			questions_lens[idx] = int(qtn_len)
 			span_start[idx] = int(ans[0])
 			span_end[idx] = int(ans[1])
 
@@ -370,7 +375,7 @@ def prepare_data(batch):
 def load_data(train_loc, dev_loc, batch_size):
 	word_emb_data = read_word_emb_data()
 	word_strs = set()
-
+	
 	trn_tab_ds = _make_tabular_dataset(train_loc, word_strs, has_answers=True, max_ans_len=max_ans_len)
 
 	dev_tab_ds = _make_tabular_dataset(dev_loc, word_strs, has_answers=True, max_ans_len=max_ans_len)
@@ -393,11 +398,12 @@ def load_data(train_loc, dev_loc, batch_size):
 							  )
 	dev_loader = DataLoader(dataset=dev_dataset,
 							shuffle=False,
-							batch_size=batch_size)
+							batch_size=batch_size,
+							collate_fn=prepare_data)
 	# collate_fn=prepare_data)
 	return train_loader, dev_loader, word_emb_data
 
-train_data, dev_data, word_emb_data = load_data(tokenized_trn_json_path, tokenized_dev_json_path, 32)
+train_data, dev_data, word_emb_data = load_data(tokenized_trn_json_path, tokenized_dev_json_path, batch_size)
 
 word_emb_tensor = torch.from_numpy(word_emb_data.word_emb)
 
@@ -439,6 +445,14 @@ class HighwayNetwork(nn.Module):
 			t_i = F.sigmoid(self.T[i](x))
 			x = t_i * h_i + (1 - t_i) * x
 		return x
+		
+
+def sort(data, seq_len):                                                  
+	""" Sort the data (B, T, D) and sequence lengths                            
+	"""                                                                         
+	sorted_seq_len, sorted_idx = seq_len.sort(0, descending=True)               
+	sorted_data = data[sorted_idx]                                              
+	return sorted_data, sorted_seq_len, sorted_idx
 
 class BiLSTM(nn.Module):
 	def __init__(self, inp_size, hidden_size=100, num_layers=1, dropout=0.2):
@@ -451,42 +465,44 @@ class BiLSTM(nn.Module):
 
 
 	def forward(self, inp, lens):
-		batch_size = inp.size()[0]
-		sort_inp, sort_lens, sort_idx = sort(inp, lens) 
-		packed = pack_padded_sequence(sort_inp, list(sort_lens.data), batch_first=True)    
-		output = self.lstm(packed)
-		output, _ = pad_packed_sequence(output, batch_first=True)
-	    # get the last time step for each sequence
-	    idx = (sort_lens - 1).view(-1, 1).expand(output.size(0), output.size(2)).unsqueeze(1)
-	    decoded = output.gather(1, idx).squeeze()
-	    # restore the sorting
-	    odx = original_index.view(-1, 1).expand(batch_size, output.size(-1))
-	    decoded = decoded.gather(0, Variable(odx))
-	    return decoded
-		outputs, (h,c) = self.lstm(inps) 
-		return outputs
-  
+		# batch_size = inp.size()[0]
+		# print('bilstm')
+		# print(inp.size())
+		# sort_inp, sort_lens, sort_idx = sort(inp, lens)
+		# print(sort_inp.size()) 
+		# packed = nn.utils.rnn.pack_padded_sequence(sort_inp, list(sort_lens.data), batch_first=True)    
+		
+		output, _ = self.lstm(inp)
+		
+		# unpacked, _ = nn.utils.rnn.pad_packed_sequence(output, batch_first=True)
+		# # get the last time step for each sequence
+		# print(output.size())
+		# idx = (sort_lens - 1).view(-1, 1).expand(output.size(0), output.size(2)).unsqueeze(1)
+		# decoded = output.gather(1, idx)
+		# # restore the sorting
+		# print(decoded.size())
+		# _, original_idx = sort_idx.sort(0, descending=True)
+		# unsorted_idx = original_idx.view(-1, 1, 1).expand_as(unpacked)
+		# output = unpacked.gather(0, unsorted_idx.long())
+		# print(output.size())
+		# print('byelstm')
+		# sys.exit()
+		return output
 
-def sort_batch(data, seq_len):                                                  
-    """ Sort the data (B, T, D) and sequence lengths                            
-    """                                                                         
-    sorted_seq_len, sorted_idx = seq_len.sort(0, descending=True)               
-    sorted_data = data[sorted_idx]                                              
-    return sorted_data, sorted_seq_len, sorted_idx
 
 class ContextualEmbeddingLayer(nn.Module):
-	def __init__(self):
+	def __init__(self, emb_dim):
 		super(ContextualEmbeddingLayer, self).__init__()
-		self.bilstm = BiLSTM(inp_size)
+		self.bilstm = BiLSTM(emb_dim)
 
 	def forward(self, inp, lens):
 		return self.bilstm(inp, lens)
 		
 
 class ModelingLayer(nn.Module):
-	def __init__(self):
+	def __init__(self, inp_size):
 		super(ModelingLayer, self).__init__()
-		self.bilstm = BiLSTM(inp_size, num_layers=2)
+		self.bilstm = BiLSTM(8*inp_size, num_layers=2)
 
 	def forward(self, inp, lens):
 		return self.bilstm(inp, lens)
@@ -500,49 +516,56 @@ class Attention(nn.Module):
 
 def masked_softmax(vector, mask):
 
-    if mask is None:
-        result = torch.nn.functional.softmax(vector, dim=-1)
-    else:
-        # To limit numerical errors from large vector elements outside mask, we zero these out
-        result = torch.nn.functional.softmax(vector * mask, dim=-1)
-        result = result * mask
-        result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
-    return result
+	if mask is None:
+		result = torch.nn.functional.softmax(vector, dim=-1)
+	else:
+		# To limit numerical errors from large vector elements outside mask, we zero these out
+		result = torch.nn.functional.softmax(vector * mask, dim=-1)
+		result = result * mask
+		result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
+	return result
 
 def masked_log_softmax(vector, mask):
-    if mask is not None:
-        vector = vector + mask.log()
-    return torch.nn.functional.log_softmax(vector, dim=1)
+	if mask is not None:
+		vector = vector + mask.log()
+	return torch.nn.functional.log_softmax(vector, dim=1)
 
-def _last_dim_sofmax(function_to_apply: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
-                               tensor: torch.Tensor,
-                               mask: Optional[torch.Tensor] = None):
-    tensor_shape = tensor.size()
-    reshaped_tensor = tensor.view(-1, tensor.size()[-1])
-    if mask is not None:
-        while mask.dim() < tensor.dim():
-            mask = mask.unsqueeze(1)
-        mask = mask.expand_as(tensor).contiguous().float()
-        mask = mask.view(-1, mask.size()[-1])
-    reshaped_result = masked_softmax(reshaped_tensor, mask)
-    return reshaped_result.view(*tensor_shape)
+def _last_dim_sofmax(tensor: torch.Tensor, mask: Optional[torch.Tensor] = None):
+	tensor_shape = tensor.size()
+	# print(tensor_shape)
+	# print(mask.size())
+	reshaped_tensor = tensor.view(-1, tensor.size()[-1])
+	if mask is not None:
+		while mask.dim() < tensor.dim():
+			mask = mask.unsqueeze(1)
+		mask = mask.expand_as(tensor).contiguous().float()
+		mask = mask.view(-1, mask.size()[-1])
+	reshaped_result = masked_softmax(reshaped_tensor, mask)
+	return reshaped_result.view(*tensor_shape)
+
+def replace_masked_values(tensor: Variable, mask: Variable, replace_with: float) -> Variable:
+	if tensor.dim() != mask.dim():
+		raise ConfigurationError("tensor.dim() (%d) != mask.dim() (%d)" % (tensor.dim(), mask.dim()))
+	one_minus_mask = 1.0 - mask
+	values_to_add = replace_with * one_minus_mask
+	return tensor * mask + values_to_add
+
 
 class C2Q(nn.Module):
-	def __init__(self, U):
+	def __init__(self):
 		super(C2Q, self).__init__()
 		self.attention = Attention()
   
-	def forward(self, S, mask):	
+	def forward(self,U, S, mask):
+		# print(S.size())	
+		# print(mask)
+		# sys.exit()
 		S_t = _last_dim_sofmax(S,mask)	 
+		# print(S_t.size())
+		# sys.exit()
 		U_ = self.attention(U, S_t)
 		return U_
 
-def replace_masked_values(tensor: Variable, mask: Variable, replace_with: float) -> Variable:
-    if tensor.dim() != mask.dim():
-        raise ConfigurationError("tensor.dim() (%d) != mask.dim() (%d)" % (tensor.dim(), mask.dim()))
-    one_minus_mask = 1.0 - mask
-    values_to_add = replace_with * one_minus_mask
-    return tensor * mask + values_to_add
 
 class Q2C(nn.Module):
 	def __init__(self):
@@ -552,7 +575,9 @@ class Q2C(nn.Module):
 	def forward(self,H, S, mask):
 		
 		N,T,d2 = H.size()
-		S_max = torch.max(S_, -1)[0].unsqueeze(-1) # Nx1xT
+		S_max = torch.max(S, -1)[0].unsqueeze(-2) # Nx1xT
+		# print(S_max.size())
+		# sys.exit()
 		S_t = _last_dim_sofmax(S_max, mask)
 		H_ = self.attention(H, S_t) # Nx1 x2d
 		H_ = H_.expand(-1,T,-1) # NxTx2d
@@ -568,6 +593,7 @@ class Similarity(nn.Module):
 	def forward(self, H, U):
 		h_size = H.size() #	NxTx2d
 		u_size = U.size() # NxJx2d
+		
 		h_ = H.unsqueeze(2).expand(-1,-1,u_size[1],-1) # NxTxJx2d
 		u_ = U.unsqueeze(1).expand(-1,h_size[1],-1,-1) # NxTxJx2d
 		h_u = torch.mul(h_,u_) # NxTxJx2d
@@ -577,18 +603,19 @@ class Similarity(nn.Module):
 		return S
 
 class BiAttentionLayer(nn.Module):
-	def __init__(self, H, U):
+	def __init__(self):
 		super(BiAttentionLayer,self).__init__()
-		self.H = H 
-		self.U = U
+		# self.H = H 
+		# self.U = U
 		
-		self.sim = Similarity()
+		self.sim = Similarity(2*100)
 		self.c2q = C2Q()
 		self.q2c = Q2C()
 
 
-	def forward(self, H ,U):
+	def forward(self, H ,U, c_mask, q_mask):
 		S = self.sim(H, U)		
+
 		U_ = self.c2q(U, S, q_mask)
 		S_ = replace_masked_values(S,q_mask.unsqueeze(1),-1e7)
 		H_ = self.q2c(H, S_, c_mask)
@@ -596,11 +623,11 @@ class BiAttentionLayer(nn.Module):
 		return G
 
 class OutputLayer(nn.Module):
-	def __init__(self):
+	def __init__(self, size):
 		super(OutputLayer, self).__init__()
-		self.linear1 = nn.Linear(10,1)
-		self.linear2 = nn.Linear(10,1)
-		self.bilstm = BiLSTM()
+		self.linear1 = nn.Linear(10*size,1)
+		self.linear2 = nn.Linear(10*size,1)
+		self.bilstm = BiLSTM(2*size)
 
 	def forward(self, G, M, lens, mask):
 		N = torch.cat([G, M], dim=-1)
@@ -614,82 +641,122 @@ class OutputLayer(nn.Module):
 
 
 class Bidaf(nn.Module):
-	def init(self, word_emb):
-		self.layer1 = EmbeddingLayer()
-		self.highway = HighwayNetwork(2)
-		self.context = ContextualEmbeddingLayer()
-		self.biattention = AttentionFlowLayer()
-		self.model = ModelingLayer()
-		self.output = OutputLayer()
+	def __init__(self, word_emb, emb_dim, hidden_size):
+		super(Bidaf, self).__init__()
+		# self.layer1 = EmbeddingLayer()
+		self.highwayC = HighwayNetwork(emb_dim, 2)
+		self.highwayQ = HighwayNetwork(emb_dim, 2)
+		self.contextC = ContextualEmbeddingLayer(emb_dim)
+		self.contextQ = ContextualEmbeddingLayer(emb_dim)
+		self.biattention = BiAttentionLayer()
+		self.model = ModelingLayer(hidden_size)
+		self.output = OutputLayer(hidden_size)
+		self.word_emb = word_emb
 
-	def forward(self, contexts, contexts_mask, questions, questions_mask, anss, contexts_lens, questions_lens):
+	def forward(self, contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens):
 		n_timesteps_cntx = contexts.size()[1]
 		n_timesteps_quest = questions.size()[1]
 		n_samples = contexts.size()[0]
+		# print('cs')
+		# print(contexts.size())
 
 		word_emb_cntx = self.word_emb[contexts.view(-1)].view( n_samples,n_timesteps_cntx, emb_dim)
 		word_emb_quest = self.word_emb[questions.view(-1)].view(n_samples,n_timesteps_quest,  emb_dim)
-
-		X = self.highway(word_emb_cntx)
-		Q = self.highway(word_emb_quest)
-
-		H = self.context(X, contexts_lens)
-		U = self.context(Q, questions_lens)
-
+		# print('cemb')
+		# print(word_emb_cntx.size())
+		X = self.highwayC(word_emb_cntx)
+		# print('hw')
+		# print(X.size())
+		Q = self.highwayQ(word_emb_quest)
+		# print(Q.size())
+		H = self.contextC(X, contexts_lens)
+		# print('con')
+		# print(H.size())
+		U = self.contextQ(Q, questions_lens)
+		# print(U.size())
 		G = self.biattention(H,U, contexts_mask, questions_mask)
-
+		# print('biatt')
+		# print(G.size())
+		
 		M = self.model(G, contexts_lens)
-
-		p1,p2,p1_,p2_ = self.output(G,M, contexts_lens)
-
+		# print('modell')
+		# print(M.size())
+		 
+		p1,p2,p1_,p2_ = self.output(G,M, contexts_lens, contexts_mask)
+		
 		return p1,p2,p1_,p2_
 
 
 
- def _get_best_span(span_start_logits: Variable, span_end_logits: Variable) -> Variable:
-		if span_start_logits.dim() != 2 or span_end_logits.dim() != 2:
-			raise ValueError("Inp shapes must be (batch_size, passage_length)")
-		batch_size, passage_length = span_start_logits.size()
-		max_span_log_prob = [-1e20] * batch_size
-		span_start_argmax = [0] * batch_size
-		best_word_span = Variable(span_start_logits.data.new()
-								  .resize_(batch_size, 2).fill_(0)).long()
+def _get_best_span(span_start_logits: Variable, span_end_logits: Variable) -> Variable:
+	if span_start_logits.dim() != 2 or span_end_logits.dim() != 2:
+		raise ValueError("Inp shapes must be (batch_size, passage_length)")
+	batch_size, passage_length = span_start_logits.size()
+	max_span_log_prob = [-1e20] * batch_size
+	span_start_argmax = [0] * batch_size
+	best_word_span = Variable(span_start_logits.data.new()
+							  .resize_(batch_size, 2).fill_(0)).long()
 
-		span_start_logits = span_start_logits.data.cpu().numpy()
-		span_end_logits = span_end_logits.data.cpu().numpy()
+	span_start_logits = span_start_logits.data.cpu().numpy()
+	span_end_logits = span_end_logits.data.cpu().numpy()
 
-		for b in range(batch_size):  # pylint: disable=invalid-name
-			for j in range(passage_length):
-				val1 = span_start_logits[b, span_start_argmax[b]]
-				if val1 < span_start_logits[b, j]:
-					span_start_argmax[b] = j
-					val1 = span_start_logits[b, j]
+	for b in range(batch_size):  # pylint: disable=invalid-name
+		for j in range(passage_length):
+			val1 = span_start_logits[b, span_start_argmax[b]]
+			if val1 < span_start_logits[b, j]:
+				span_start_argmax[b] = j
+				val1 = span_start_logits[b, j]
 
-				val2 = span_end_logits[b, j]
+			val2 = span_end_logits[b, j]
 
-				if val1 + val2 > max_span_log_prob[b]:
-					best_word_span[b, 0] = span_start_argmax[b]
-					best_word_span[b, 1] = j
-					max_span_log_prob[b] = val1 + val2
-		return best_word_span
+			if val1 + val2 > max_span_log_prob[b]:
+				best_word_span[b, 0] = span_start_argmax[b]
+				best_word_span[b, 1] = j
+				max_span_log_prob[b] = val1 + val2
+	return best_word_span
 		
 
-all_letters = string.ascii_letters + " .,;'"
-n_letters = len(all_letters)
+def get_score(best_span, span_start, span_end):
+	batch_size= span_start.size()[0]
+	f1_score = 0.0
+	em_score = 0.0
+	for i in range(batch_size):
+		
+		ground = set(list(range(span_start.data[i],span_end.data[i]+1)))
+		pred = set(list(range(best_span.data[i][0], best_span.data[i][1]+1)))
+		# print(ground)		
+		# print(pred)
+		inter = pred & ground
+		# print('inter')
+		# print(len(inter))
+		# print(inter)
+		prec =  len(inter)/len(pred)
+		rec = len(inter)/len(ground)
+		f1=0.0
+		em = 0.0
+		if prec!=0 and rec!=0:
+			f1 = 2*prec*rec/(prec+rec)
+		if pred == ground:
+			em=1.0
+		f1_score+=f1
+		em_score+=em
+	return f1_score, em_score
 
-# Find letter index from all_letters, e.g. "a" = 0
-def letterToIndex(letter):
-	return all_letters.find(letter)
+# all_letters = string.ascii_letters + " .,;'"
+# n_letters = len(all_letters)
+
+# # Find letter index from all_letters, e.g. "a" = 0
+# def letterToIndex(letter):
+# 	return all_letters.find(letter)
 
 
-# Turn a line into a <line_length x 1 x n_letters>,
-# or an array of one-hot letter vectors
-def lineToTensor(line):
-	tensor = torch.zeros(len(line), 1, n_letters)
-	for li, letter in enumerate(line):
-		tensor[li][0][letterToIndex(letter)] = 1
-	return tensor
-
+# # Turn a line into a <line_length x 1 x n_letters>,
+# # or an array of one-hot letter vectors
+# def lineToTensor(line):
+# 	tensor = torch.zeros(len(line), 1, n_letters)
+# 	for li, letter in enumerate(line):
+# 		tensor[li][0][letterToIndex(letter)] = 1
+# 	return tensor
 model = Bidaf(word_emb, emb_dim, hidden_dim)
 
 if can_use_gpu:
@@ -697,21 +764,22 @@ if can_use_gpu:
 
 optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
 
-x = 0
-train_loss_hist = []
-train_acc_hist = []
 for epoch in range(max_num_epochs):
 	loss_curr_epoch = 0.0
-	acc_curr_epoch = 0.0
+	F1_curr_epoch = 0.0
+	EM_curr_epoch = 0.0
 	n_done = 0
 	uidx = 0
+	train_size = len(train_data)
+
 	for data in train_data:
+		
 		model.train()
 		model.zero_grad()
 		optimizer.zero_grad()
 
 		contexts = Variable(data[0])
-		n_done += contexts.size(1)
+		n_done += contexts.size()[0]
 		contexts_mask = Variable(data[1])
 		questions = Variable(data[2])
 		questions_mask = Variable(data[3])
@@ -726,29 +794,64 @@ for epoch in range(max_num_epochs):
 		log_p1 = masked_log_softmax(p1, contexts_mask)
 		log_p2 = masked_log_softmax(p2, contexts_mask)
 
-		loss = F.nll_loss(log_p1, span_start) + F.nll_loss(log_p2, span_end)
-
-		loss_curr_epoch += sum_loss
-		acc_curr_epoch += sum_acc
-		msg = 'uidx = ', uidx, 'Current batch Accuracy %= ', acc.data[0] * 100, ' --  Loss = ', loss.data[0]
-		print(msg)
-		logger.info(msg)
-		uidx += 1
+		loss = F.nll_loss(log_p1, span_start,size_average=False) + F.nll_loss(log_p2, span_end,size_average=False)
+		
 		loss.backward()
+		optimizer.step()
+		best_span = _get_best_span(p1,p2)
 
-	current_epoch_train_loss = loss_curr_epoch / n_done
-	current_epoch_train_acc = acc_curr_epoch / n_done
-	epoch_msg = 'End of Epoch' + (
-	epoch + 1) + '. Training Accuracy %= ', current_epoch_train_acc * 100, ' --  Loss = ', current_epoch_train_loss
-	print(epoch_msg)
+		f1,em = get_score(best_span, span_start, span_end)
+
+		batch_size = questions.size()[0]
+		loss_curr_epoch += loss
+		F1_curr_epoch += f1
+		EM_curr_epoch += em
+		msg = 'uidx = '+str(uidx)+ ' -- Current batch F1 %= '+ str(100.0*f1/batch_size) + ' --  EM = '+ str(100*em/batch_size) + ' --  Loss = '+ str(loss.data[0]/batch_size) + ' (' +str(n_done)+'/' + str(train_size) + ')'
+		# print(msg)
+		logger.info(msg)
+		
+
+	epoch_msg = 'End of Epoch ' + str(epoch + 1) + '.-- Training F1 %= ' +str(F1_curr_epoch * 100.0/train_size) + ' --  EM = '+ str(100.0*EM_curr_epoch/train_size)+ ' --  Loss = ' + str(loss_curr_epoch.data[0] / train_size)
+	# print(epoch_msg)
 	logger.info(epoch_msg)
-	train_loss_hist.append(current_epoch_train_loss)
-	train_acc_hist.append(current_epoch_train_acc)
 
+	valloss_curr_epoch = 0.0
+	valF1_curr_epoch = 0.0
+	valEM_curr_epoch = 0.0
+	test_size = len(dev_data)
+	for data in dev_data:
+		model.eval()
+		contexts = Variable(data[0])
+		n_done += contexts.size()[0]
+		contexts_mask = Variable(data[1])
+		questions = Variable(data[2])
+		questions_mask = Variable(data[3])
+		anss = data[4]
+		contexts_lens = Variable(data[5])
+		questions_lens = Variable(data[6])
+		span_start = Variable(data[7])
+		span_end = Variable(data[8])
 
+		p1, p2, p1_, p2_ = model(contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens)
+		log_p1 = masked_log_softmax(p1, contexts_mask)
+		log_p2 = masked_log_softmax(p2, contexts_mask)
 
+		loss = F.nll_loss(log_p1, span_start,size_average=False) + F.nll_loss(log_p2, span_end,size_average=False)
+		
+		f1,em = get_score(best_span, span_start, span_end)
 
-
+		batch_size = questions.size()[0]
+		valloss_curr_epoch += loss
+		valF1_curr_epoch += f1
+		valEM_curr_epoch += em
+		break
+		
+	epoch_msg = 'End of Epoch ' + str(epoch + 1) + '.-- Validation F1 %= ' +str(valF1_curr_epoch * 100.0/test_size) + ' --  EM = '+ str(100.0*valEM_curr_epoch/test_size)+ ' --  Loss = ' + str(valloss_curr_epoch.data[0] / test_size)
+	# print(epoch_msg)
+	logger.info(epoch_msg)
+	
+	
+	
 
 
 
