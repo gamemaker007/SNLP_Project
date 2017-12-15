@@ -30,7 +30,7 @@ seed = np.random.random_integers(1e6, 1e9)
 max_ans_len = 30  # maximal answer length, answers of longer length are discarded
 emb_dim = 300  # dimension of word embeddings
 learn_single_unk = True  # whether to have a single tunable word embedding for all unknown words # (or multiple fixed random ones)
-init_scale = 5e-3  # uniformly random weights are initialized in [-init_scale, +init_scale]
+init_scale = 5e-3  # uniform_ly random weights are initialized in [-init_scale, +init_scale]
 learning_rate = 1e-3
 lr_decay = 0.95
 lr_decay_freq = 5000  # frequency with which to decay learning rate, measured in updates
@@ -48,10 +48,10 @@ lstm_learn_initial_state = False
 lstm_tie_x_dropout = True
 lstm_sep_x_dropout = False
 lstm_sep_h_dropout = False
-lstm_w_init = 'uniform'
-lstm_u_init = 'uniform'
-lstm_forget_bias_init = 'uniform'
-default_bias_init = 'uniform'
+lstm_w_init = 'uniform_'
+lstm_u_init = 'uniform_'
+lstm_forget_bias_init = 'uniform_'
+default_bias_init = 'uniform_'
 extra_drop_x = 0  # dropout rate at an extra possible place
 q_aln_ff_tie = True  # whether to tie the weights of the FF over question and the FF over passage
 sep_stt_end_drop = True  # whether to have separate dropout masks for span start and # span end representations
@@ -340,6 +340,7 @@ def prepare_data(batch):
 		contexts_lens = contexts_lens.cuda()
 		questions = questions.cuda()
 		questions_mask = questions_mask.cuda()
+		questions_lens = questions_lens.cuda()
 		final_answers = final_answers.cuda()
 		span_start = span_start.cuda()
 		span_end = span_end.cuda()
@@ -413,7 +414,7 @@ if can_use_gpu:
 word_emb = Variable(word_emb_tensor)
 
 
-class CharCNN():
+class CharCNN(nn.Module):
 	def __init__(self,emb_dim, num_filters=100, kernel_size=5, out_size=5):
 		super(CharCNN,self).__init__()
 		self.emb_dim = emb_dim
@@ -437,15 +438,23 @@ class HighwayNetwork(nn.Module):
 		self.dim = dim
 		self.H = nn.ModuleList([nn.Linear(dim, dim) for l in range(num_layers)])
 		self.T = nn.ModuleList([nn.Linear(dim, dim) for t in range(num_layers)])
-		for t_i in self.T:
-			t_i.bias.data.fill_(-1)
+		self.init_weights()
+
 	def forward(self, x):
 		for i in range(self.num_layers):
 			h_i = F.relu(self.H[i](x))
 			t_i = F.sigmoid(self.T[i](x))
 			x = t_i * h_i + (1 - t_i) * x
 		return x
-		
+
+	def init_weights(self):
+		initrange = 0.1
+		for i in range(self.num_layers):
+			self.H[i].weight.data.uniform_(-initrange,initrange)
+			self.T[i].weight.data.uniform_(-initrange,initrange)
+			self.T[i].bias.data.fill_(-1)
+			self.H[i].bias.data.fill_(0)
+	
 
 def sort(data, seq_len):                                                  
 	""" Sort the data (B, T, D) and sequence lengths                            
@@ -462,7 +471,15 @@ class BiLSTM(nn.Module):
 						   batch_first=True,
 						   dropout=dropout,
 						   bidirectional=True)
+		self.init_weights()
 
+	def init_weights(self):
+		initrange = 0.1
+		for name, param in self.lstm.named_parameters():
+		  if 'bias' in name:
+		     nn.init.constant(param, 0.0)
+		  elif 'weight' in name:
+		     nn.init.uniform(param,-initrange,initrange)
 
 	def forward(self, inp, lens):
 		# batch_size = inp.size()[0]
@@ -589,6 +606,13 @@ class Similarity(nn.Module):
 		super(Similarity, self).__init__()
 		self.d2 = d2
 		self.linear = nn.Linear(3*d2,1)
+		self.init_weights()
+		
+	def init_weights(self):
+		initrange = 0.1
+		self.linear.weight.data.uniform_(-initrange,initrange)
+		self.linear.bias.data.fill_(0)
+
 
 	def forward(self, H, U):
 		h_size = H.size() #	NxTx2d
@@ -628,13 +652,23 @@ class OutputLayer(nn.Module):
 		self.linear1 = nn.Linear(10*size,1)
 		self.linear2 = nn.Linear(10*size,1)
 		self.bilstm = BiLSTM(2*size)
+		self.do = nn.Dropout(p=0.2)
+		self.init_weights()
+		
+	def init_weights(self):
+		initrange = 0.1
+		self.linear1.weight.data.uniform_(-initrange,initrange)
+		self.linear1.bias.data.fill_(0)
+		self.linear2.weight.data.uniform_(-initrange,initrange)
+		self.linear2.bias.data.fill_(0)
+
 
 	def forward(self, G, M, lens, mask):
-		N = torch.cat([G, M], dim=-1)
+		N = self.do(torch.cat([G, M], dim=-1))
 		p1 = self.linear1(N).squeeze(-1)
 		p1_ = masked_softmax(p1, mask)
-		M2 = self.bilstm(M, lens)
-		M = torch.cat([G, M2], dim=-1)
+		M2 = self.do(self.bilstm(M, lens))
+		M = self.do(torch.cat([G, M2], dim=-1))
 		p2 = self.linear2(M).squeeze(-1)
 		p2_ = masked_softmax(p2, mask)
 		return p1,p2,p1_,p2_
@@ -644,6 +678,7 @@ class Bidaf(nn.Module):
 	def __init__(self, word_emb, emb_dim, hidden_size):
 		super(Bidaf, self).__init__()
 		# self.layer1 = EmbeddingLayer()
+		# self.char_emb = nn.Embedding()
 		self.highwayC = HighwayNetwork(emb_dim, 2)
 		self.highwayQ = HighwayNetwork(emb_dim, 2)
 		self.contextC = ContextualEmbeddingLayer(emb_dim)
@@ -652,6 +687,9 @@ class Bidaf(nn.Module):
 		self.model = ModelingLayer(hidden_size)
 		self.output = OutputLayer(hidden_size)
 		self.word_emb = word_emb
+		self.do = nn.Dropout(p=0.2)
+	
+
 
 	def forward(self, contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens):
 		n_timesteps_cntx = contexts.size()[1]
@@ -661,24 +699,24 @@ class Bidaf(nn.Module):
 		# print(contexts.size())
 
 		word_emb_cntx = self.word_emb[contexts.view(-1)].view( n_samples,n_timesteps_cntx, emb_dim)
-		word_emb_quest = self.word_emb[questions.view(-1)].view(n_samples,n_timesteps_quest,  emb_dim)
-		# print('cemb')
+		word_emb_quest = self.word_emb[questions.view(-1)].view(n_samples,n_timesteps_quest,  emb_dim)	
+		# print('cemb')	
 		# print(word_emb_cntx.size())
 		X = self.highwayC(word_emb_cntx)
 		# print('hw')
 		# print(X.size())
 		Q = self.highwayQ(word_emb_quest)
 		# print(Q.size())
-		H = self.contextC(X, contexts_lens)
+		H = self.do(self.contextC(X, contexts_lens))
 		# print('con')
 		# print(H.size())
-		U = self.contextQ(Q, questions_lens)
+		U = self.do(self.contextQ(Q, questions_lens))
 		# print(U.size())
 		G = self.biattention(H,U, contexts_mask, questions_mask)
 		# print('biatt')
 		# print(G.size())
 		
-		M = self.model(G, contexts_lens)
+		M = self.do(self.model(G, contexts_lens))
 		# print('modell')
 		# print(M.size())
 		 
@@ -742,21 +780,6 @@ def get_score(best_span, span_start, span_end):
 		em_score+=em
 	return f1_score, em_score
 
-# all_letters = string.ascii_letters + " .,;'"
-# n_letters = len(all_letters)
-
-# # Find letter index from all_letters, e.g. "a" = 0
-# def letterToIndex(letter):
-# 	return all_letters.find(letter)
-
-
-# # Turn a line into a <line_length x 1 x n_letters>,
-# # or an array of one-hot letter vectors
-# def lineToTensor(line):
-# 	tensor = torch.zeros(len(line), 1, n_letters)
-# 	for li, letter in enumerate(line):
-# 		tensor[li][0][letterToIndex(letter)] = 1
-# 	return tensor
 model = Bidaf(word_emb, emb_dim, hidden_dim)
 
 if can_use_gpu:
@@ -789,6 +812,8 @@ for epoch in range(max_num_epochs):
 		span_start = Variable(data[7])
 		span_end = Variable(data[8])
 
+
+
 		p1, p2, p1_, p2_ = model(contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens)
 
 		log_p1 = masked_log_softmax(p1, contexts_mask)
@@ -807,8 +832,9 @@ for epoch in range(max_num_epochs):
 		F1_curr_epoch += f1
 		EM_curr_epoch += em
 		msg = 'uidx = '+str(uidx)+ ' -- Current batch F1 %= '+ str(100.0*f1/batch_size) + ' --  EM = '+ str(100*em/batch_size) + ' --  Loss = '+ str(loss.data[0]/batch_size) + ' (' +str(n_done)+'/' + str(train_size) + ')'
-		# print(msg)
+		print(msg)
 		logger.info(msg)
+		sys.exit()
 		
 
 	epoch_msg = 'End of Epoch ' + str(epoch + 1) + '.-- Training F1 %= ' +str(F1_curr_epoch * 100.0/train_size) + ' --  EM = '+ str(100.0*EM_curr_epoch/train_size)+ ' --  Loss = ' + str(loss_curr_epoch.data[0] / train_size)
