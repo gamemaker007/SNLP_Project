@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-
+from Utils import read_word_emb_data
 
 metadata_path = "data/preprocessed_glove_with_unks.split.metadata.pkl"
 emb_path = "data/preprocessed_glove_with_unks.split.emb.npy"
@@ -23,3 +23,4 @@ hidden_dim = 100
 lstm_drop_h = 0.1
 lstm_drop_x = 0.4
 log_file_name = 'testingLog'
+word_emb_data = read_word_emb_data()
