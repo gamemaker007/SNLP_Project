@@ -30,9 +30,7 @@ max_ans_len = 30  # maximal answer length, answers of longer length are discarde
 emb_dim = 300  # dimension of word embeddings
 learn_single_unk = True  # whether to have a single tunable word embedding for all unknown words # (or multiple fixed random ones)
 init_scale = 5e-3  # uniform_ly random weights are initialized in [-init_scale, +init_scale]
-learning_rate = 1e-3
-lr_decay = 0.95
-lr_decay_freq = 5000  # frequency with which to decay learning rate, measured in updates
+learning_rate = 1e-3 # frequency with which to decay learning rate, measured in updates
 max_grad_norm = 10  # gradient clipping
 ff_dims = [100]  # dimensions of hidden FF layers
 ff_drop_x = 0.2  # dropout rate of FF layers
@@ -40,29 +38,8 @@ batch_size = 30
 max_num_epochs = 20  # max number of epochs to train for
 num_bilstm_layers = 2  # number of BiLSTM layers, where BiLSTM is applied
 hidden_dim = 100  # dimension of hidden state of each uni-directional LSTM
-lstm_drop_h = 0.1  # dropout rate for recurrent hidden state of LSTM
-lstm_drop_x = 0.4  # dropout rate for inps of LSTM
-lstm_couple_i_and_f = True  # customizable LSTM configuration, see base/model.py
-lstm_learn_initial_state = False
-lstm_tie_x_dropout = True
-lstm_sep_x_dropout = False
-lstm_sep_h_dropout = False
-lstm_w_init = 'uniform_'
-lstm_u_init = 'uniform_'
-lstm_forget_bias_init = 'uniform_'
-default_bias_init = 'uniform_'
-extra_drop_x = 0  # dropout rate at an extra possible place
-q_aln_ff_tie = True  # whether to tie the weights of the FF over question and the FF over passage
-sep_stt_end_drop = True  # whether to have separate dropout masks for span start and # span end representations
-adam_beta1 = 0.9  # see base/optimizer.py
-adam_beta2 = 0.999
-adam_eps = 1e-8
-objective = 'span_multinomial'  # 'span_multinomial': multinomial distribution over all spans
-# 'span_binary':      logistic distribution per span
-# 'span_endpoints':   two multinomial distributions, over span start and end
-ablation = None
 
-log_file_name = 'snlp_bidaf_log6.out'
+log_file_name = 'snlp_bidaf_log4.out'
 
 
 
@@ -345,6 +322,7 @@ def prepare_data(batch):
 	final_answers = torch.zeros(n_samples, 2).long()
 	span_start = torch.zeros(n_samples, ).long()
 	span_end = torch.zeros(n_samples, ).long()
+	final_y = torch.zeros(n_samples,).long()
 
 	if can_use_gpu:
 		contexts = contexts.cuda()
@@ -356,7 +334,7 @@ def prepare_data(batch):
 		final_answers = final_answers.cuda()
 		span_start = span_start.cuda()
 		span_end = span_end.cuda()
-
+		final_y = final_y.cuda()
 
 
 	for idx, [ctx, ctx_len, qtn, qtn_len, ans] in enumerate(zip(ctxs, ctx_lens, qtns, qtn_lens, anss)):
@@ -370,6 +348,8 @@ def prepare_data(batch):
 			questions_lens[idx] = int(qtn_len)
 			span_start[idx] = int(ans[0])
 			span_end[idx] = int(ans[1])
+			final_y[idx] = int(_np_ans_word_idxs_to_ans_idx(ans[0], ans[1], max_ans_len))
+
 
 		else:
 			contexts[idx, :ctx_len] = torch.from_numpy(ctx[:ctx_len]).long()
@@ -381,8 +361,10 @@ def prepare_data(batch):
 			questions_lens[idx] = int(qtn_len)
 			span_start[idx] = int(ans[0])
 			span_end[idx] = int(ans[1])
+			final_y[idx] = int(_np_ans_word_idxs_to_ans_idx(ans[0], ans[1], max_ans_len))
 
-	return contexts, contexts_mask, questions, questions_mask, final_answers, contexts_lens, questions_lens, span_start, span_end
+
+	return contexts, contexts_mask, questions, questions_mask, final_answers, contexts_lens, questions_lens, span_start, span_end, final_y
 
 
 def load_data(train_loc, dev_loc, batch_size):
@@ -524,15 +506,6 @@ class ContextualEmbeddingLayer(nn.Module):
 
 	def forward(self, inp, lens):
 		return self.bilstm(inp, lens)
-
-class HigherContextualEmbeddingLayer(nn.Module):
-	def __init__(self, emb_dim):
-		super(HigherContextualEmbeddingLayer, self).__init__()
-		self.bilstm = BiLSTM(10*emb_dim)
-
-	def forward(self, A,B, lens):
-		I = torch.cat([A,B],-1)
-		return self.bilstm(I, lens)
 		
 
 class ModelingLayer(nn.Module):
@@ -682,11 +655,9 @@ class OutputLayer(nn.Module):
 		super(OutputLayer, self).__init__()
 		self.linear1 = nn.Linear(10*size,1)
 		self.linear2 = nn.Linear(10*size,1)
-		self.bilstm = BiLSTM(14*size)
+		self.bilstm = BiLSTM(2*size)
 		self.do = nn.Dropout(p=0.2)
 		self.init_weights()
-		self.attention = Attention()
-		self.size = size
 		
 	def init_weights(self):
 		initrange = 0.1
@@ -697,14 +668,10 @@ class OutputLayer(nn.Module):
 
 
 	def forward(self, G, M, lens, mask):
-		batch_size,passage_length,dim = M.size()
 		N = self.do(torch.cat([G, M], dim=-1))
 		p1 = self.linear1(N).squeeze(-1)
 		p1_ = masked_softmax(p1, mask)
-		MM = self.attention(M, p1_.unsqueeze(1))
-		MM = MM.expand(-1,passage_length,-1)
-		MMM = self.do(torch.cat([G,M,MM,M*MM],dim=-1))
-		M2 = self.do(self.bilstm(MMM, lens))
+		M2 = self.do(self.bilstm(M, lens))
 		M = self.do(torch.cat([G, M2], dim=-1))
 		p2 = self.linear2(M).squeeze(-1)
 		p2_ = masked_softmax(p2, mask)
@@ -716,23 +683,112 @@ class Bidaf(nn.Module):
 		super(Bidaf, self).__init__()
 		# self.layer1 = EmbeddingLayer()
 		# self.char_emb = nn.Embedding()
-		# self.highwayC = HighwayNetwork(emb_dim, 2)
-		# self.highwayQ = HighwayNetwork(emb_dim, 2)
-		self.highway = HighwayNetwork(emb_dim,2)
-		# self.contextC = ContextualEmbeddingLayer(emb_dim)
-		# self.contextQ = ContextualEmbeddingLayer(emb_dim)
-		self.context = ContextualEmbeddingLayer(emb_dim)
-		self.highercontext = HigherContextualEmbeddingLayer(hidden_size)
+		self.highwayC = HighwayNetwork(emb_dim, 2)
+		self.highwayQ = HighwayNetwork(emb_dim, 2)
+		self.contextC = ContextualEmbeddingLayer(emb_dim)
+		self.contextQ = ContextualEmbeddingLayer(emb_dim)
 		self.biattention = BiAttentionLayer()
-		self.biatt = BiAttentionLayer()
 		self.model = ModelingLayer(hidden_size)
 		self.output = OutputLayer(hidden_size)
 		self.word_emb = word_emb
 		self.do = nn.Dropout(p=0.2)
+		self.ff_dims=100
+		self.linear_ans_start = nn.Linear(2*hidden_dim, self.ff_dims)
+		self.linear_ans_end = nn.Linear(2*hidden_dim, self.ff_dims)
+		self.linear_span = nn.Linear(self.ff_dims, 1, bias = False)
+		
+	def compute_answer(self,p_level_h_for_stt, p_level_h_for_end, p_lens, batch_size, anss):
+			max_p_len = p_level_h_for_stt.size(0)
+			p_stt_lin =self.linear_ans_start(self.do(p_level_h_for_stt))
+			
+			p_end_lin =self.linear_ans_end(self.do(p_level_h_for_end))
+			
+			span_lin_reshaped, span_masks_reshaped = self._span_sums(p_stt_lin, p_end_lin, p_lens, max_p_len, batch_size, self.ff_dims, max_ans_len)
+			span_ff_reshaped = F.relu(span_lin_reshaped)  # (batch_size, max_p_len*max_ans_len, ff_dim)
+			span_scores_reshaped = self.linear_span(span_ff_reshaped).squeeze()
+			xents, accs, a_hats = self._span_multinomial_classification(span_scores_reshaped, span_masks_reshaped, anss)
+			loss = xents.mean()
+			acc = accs.mean()
+			sum_acc = accs.sum()
+			sum_loss = loss.sum()
+			return loss, acc, sum_acc, sum_loss, a_hats
+
+	def softmax_columns_with_mask(self, x, mask, allow_none=False):
+			assert len(x.size()) == 2
+			assert len(mask.size()) == 2
+			# for numerical stability
+
+			x = x*mask
+			x = x - x.min(dim=0, keepdim=True)[0]
+			x = x*mask
+			x = x - x.max(dim=0, keepdim=True)[0]
+			e_x = mask * torch.exp(x)
+			sums = e_x.sum(dim=0, keepdim=True)
+			if allow_none:
+				sums += torch.eq(sums, 0)
+			y = e_x / sums
+			return y
+
+	def _span_multinomial_classification(self, x, x_mask, y):
+		# x       float32 (batch_size, num_classes)   scores i.e. logits
+		# x_mask  int32   (batch_size, num_classes)   score masks (each sample has a variable number of classes)
+		# y       int32   (batch_size,)               target classes i.e. ground truth answers (given as class indices)
+		assert len(x.size()) == len(x_mask.size()) == 2
+		assert len(y.size()) == 1
+
+		# substracting min needed since all non masked-out elements of a row may be negative.
+		x = x * x_mask
+		x = x - x.min(dim=0, keepdim=True)[0]  # (batch_size, num_classes)
+		x = x * x_mask  # (batch_size, num_classes)
+		y_hats = x.max(dim=1)[1]  # (batch_size,)
+		accs = torch.eq(y_hats.long(), y.long()).float()  # (batch_size,)
+		x = x - x.max(dim=1, keepdim=True)[0]  # (batch_size, num_classes)
+		x = x * x_mask  # (batch_size, num_classes)
+		exp_x = torch.exp(x)  # (batch_size, num_classes)
+		exp_x = exp_x * x_mask  # (batch_size, num_classes)
+
+		sum_exp_x = exp_x.sum(dim=1)  # (batch_size,)
+		log_sum_exp_x = torch.log(sum_exp_x)  # (batch_size,)
+		index1 = torch.arange(0,x.size(0)).long()
+		if can_use_gpu:
+			index1 = index1.cuda()
+		x_star = x[index1, y.data]  # (batch_size,)
+		xents = log_sum_exp_x - x_star  # (batch_size,)
+		return xents, accs, y_hats
 	
+	def _span_sums(self, stt, end, p_lens, max_p_len, batch_size, dim, max_ans_len):
+		max_ans_len_range = torch.arange(0,max_ans_len).unsqueeze(0)  # (1, max_ans_len)
+		offsets = torch.arange(0,max_p_len).unsqueeze(1)  # (max_p_len, 1)
+		if can_use_gpu:
+			max_ans_len_range = max_ans_len_range.cuda()
+			offsets = offsets.cuda()
 
+		end_idxs = max_ans_len_range + offsets  # (max_p_len, max_ans_len)
+		end_idxs_flat = end_idxs.view(-1).long()  # (max_p_len*max_ans_len,)
+		extra_zeros = torch.zeros(max_ans_len - 1, batch_size, dim)
+		if can_use_gpu:
+			extra_zeros = extra_zeros.cuda()
+		#print(end.size(), extra_zeros.size())
+		end_padded = torch.cat([end, Variable(extra_zeros)], 0)# (max_p_len+max_ans_len-1, batch_size, dim)
+		
+		end_structured = end_padded[end_idxs_flat]  # (max_p_len*max_ans_len, batch_size, dim)
+		
+		end_structured = end_structured.view(max_p_len, max_ans_len, batch_size, dim)  # (max_p_len, max_ans_len, batch_size, dim)
+		stt_shuffled = stt.unsqueeze(3).permute(0, 3, 1, 2)  # (max_p_len, 1, batch_size, dim)
 
-	def forward(self, contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens):
+		span_sums = stt_shuffled + end_structured  # (max_p_len, max_ans_len, batch_size, dim)
+		span_sums_reshaped = span_sums.permute(2, 0, 1, 3).contiguous().view(batch_size, max_p_len * max_ans_len, dim) # (batch_size, max_p_len*max_ans_len, dim)
+
+		p_lens_shuffled = p_lens.unsqueeze(1)  # (batch_size, 1)
+		end_idxs_flat_shuffled = end_idxs_flat.unsqueeze(0)  # (1, max_p_len*max_ans_len)
+
+		span_masks_reshaped = torch.lt(Variable(end_idxs_flat_shuffled), p_lens_shuffled)  # (batch_size, max_p_len*max_ans_len)
+		span_masks_reshaped = span_masks_reshaped.float()
+
+		# (batch_size, max_p_len*max_ans_len, dim), (batch_size, max_p_len*max_ans_len)
+		return span_sums_reshaped, span_masks_reshaped
+	
+	def forward(self, contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens, anss):
 		n_timesteps_cntx = contexts.size()[1]
 		n_timesteps_quest = questions.size()[1]
 		n_samples = contexts.size()[0]
@@ -746,36 +802,72 @@ class Bidaf(nn.Module):
 		logger.debug(word_emb_cntx.size())
 		
 		logger.debug('hw')
-		X = self.highway(word_emb_cntx)		
+		X = self.highwayC(word_emb_cntx)		
 		logger.debug(X.size())
-		Q = self.highway(word_emb_quest)
+		Q = self.highwayQ(word_emb_quest)
 		logger.debug(Q.size())
 
 		logger.debug('con')
-		H = self.do(self.context(X, contexts_lens))		
+		H = self.do(self.contextC(X, contexts_lens))		
 		logger.debug(H.size())
-		U = self.do(self.context(Q, questions_lens))
+		U = self.do(self.contextQ(Q, questions_lens))
 		logger.debug(U.size())
 
 		logger.debug('biatt')
 		G = self.biattention(H,U, contexts_mask, questions_mask)
 		logger.debug(G.size())
 
-		H_hat = self.do(self.highercontext(H,G,contexts_lens))
-		G_hat = self.biatt(H_hat,U,contexts_mask,questions_mask)
-
-		logger.debug('model')
-		M = self.do(self.model(G_hat, contexts_lens))
+		logger.debug('modell')
+		M = self.do(self.model(G, contexts_lens))
 		logger.debug(M.size())
-		 
-
-		p1,p2,p1_,p2_ = self.output(G_hat,M, contexts_lens, contexts_mask)
 		
-		return p1,p2,p1_,p2_
+		M = torch.transpose(M, 0, 1)
+		loss, acc, sum_acc, sum_loss, a_hats = self.compute_answer(M,M, contexts_lens, n_samples, anss)
+
+		ans_hat_start_word_idxs, ans_hat_end_word_idxs = self._tt_ans_idx_to_ans_word_idxs(a_hats, max_ans_len)
+
+		return loss, acc, sum_acc, sum_loss, ans_hat_start_word_idxs, ans_hat_end_word_idxs
+		
+		
+	def _tt_ans_idx_to_ans_word_idxs(self, ans_idx, max_ans_len):
+
+		ans_start_word_idx = torch.zeros(ans_idx.size(0), ).long()
+		ans_end_word_idx = torch.zeros(ans_idx.size(0), ).long()
+		for i in range(ans_idx.size(0)):
+			ans_start_word_idx[i] = ans_idx.data[i] // max_ans_len
+			ans_end_word_idx[i] = ans_start_word_idx[i] + ans_idx.data[i] % max_ans_len
+
+		return ans_start_word_idx, ans_end_word_idx
 
 
+	def softmax_depths_with_mask(self,x, mask):
+		assert len(x.size()) == 3
+		assert len(mask.size()) == 3
+		# for numerical stability
+		x = x*mask
+		x = x - x.min(dim=2, keepdim=True)[0]
+		x = x*mask
+		x = x - x.max(dim=2, keepdim=True)[0]
+		e_x = mask * torch.exp(x)
+		sums = e_x.sum(dim=2, keepdim=True)
+		y = e_x / (sums + (torch.eq(sums, 0).float()))
+		y = y*mask
+		return y
+	
+	def init_weights(self):
+		initrange = 0.1
+		with_bias = [ self.linear_ans_start,  self.linear_ans_end]
+		without_bias = [ self.linear_span]
+
+		for layer in with_bias:
+			layer.weight.data.uniform_(-initrange, initrange)
+			layer.bias.data.fill_(0)
+		for layer in without_bias:
+			layer.weight.data.uniform_(-initrange, initrange)
 
 def _get_best_span(span_start_logits, span_end_logits):
+	# if span_start_logits.dim() != 2 or span_end_logits.dim() != 2:
+	# 	raise ValueError("Inp shapes must be (batch_size, passage_length)")
 	batch_size, passage_length = span_start_logits.size()
 	max_span_log_prob = [-1e20] * batch_size
 	span_start_argmax = [0] * batch_size
@@ -800,14 +892,14 @@ def _get_best_span(span_start_logits, span_end_logits):
 	return best_word_span
 		
 
-def get_score(best_span, span_start, span_end):
+def get_score(best_span_start, best_span_end, span_start, span_end):
 	batch_size= span_start.size()[0]
 	f1_score = 0.0
 	em_score = 0.0
 	for i in range(batch_size):
 		
 		ground = set(list(range(span_start[i],span_end[i]+1)))
-		pred = set(list(range(best_span[i][0], best_span[i][1]+1)))
+		pred = set(list(range(best_span_start[i], best_span_end[i]+1)))
 		# logger.debug(ground)		
 		# logger.debug(pred)
 		inter = pred & ground
@@ -857,34 +949,28 @@ def train(epoch):
 		questions_lens = Variable(data[6])
 		span_start = Variable(data[7])
 		span_end = Variable(data[8])
+		final_y = Variable(data[9])
 		
 
-		p1, p2, p1_, p2_ = model(contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens)
+		loss, acc, sum_acc, sum_loss, ans_hat_start_word_idx,ans_hat_end_word_idx= model(contexts, contexts_mask, 
+			questions, questions_mask, contexts_lens, questions_lens, final_y)
 		
-		
-		log_p1 = masked_log_softmax(p1, contexts_mask)
-		log_p2 = masked_log_softmax(p2, contexts_mask)
-
-		loss = F.nll_loss(log_p1, span_start,size_average=False) + F.nll_loss(log_p2, span_end,size_average=False)
-		
+			
 		loss.backward(retain_graph=False)
 		optimizer.step()
 		loss = loss.detach()
-		p1=p1.detach()
-		p2=p2.detach()
-		span_start = span_start.detach()
-		span_end = span_end.detach()
+		# ans_hat_start_word_idx = ans_hat_start_word_idx.detach()
+		# ans_hat_end_word_idx = ans_hat_end_word_idx.detach()
 
-		best_span = _get_best_span(p1.data,p2.data)
-
-		f1,em = get_score(best_span, span_start.data, span_end.data)
+		f1,em = get_score(ans_hat_start_word_idx, ans_hat_end_word_idx , 
+			span_start.data, span_end.data)
 				
 		batch_size = questions.size()[0]		
-		loss_curr_epoch += loss.data[0]
+		loss_curr_epoch += sum_loss.data[0]
 		F1_curr_epoch += f1
 		EM_curr_epoch += em
 		if uidx%100==0:
-			msg = 'uidx = '+str(uidx)+ ' -- Current batch F1 %= '+ str(100.0*f1/batch_size) + ' --  EM = '+ str(100*em/batch_size) + ' --  Loss = '+ str(loss.data[0]/batch_size) + ' (' +str(n_done)+'/' + str(train_size) + ')'
+			msg = 'uidx = '+str(uidx)+ ' -- Current batch F1 %= '+ str(100.0*f1/batch_size) + ' --  EM = '+ str(100*em/batch_size) + ' --  Loss = '+ str(sum_loss.data[0]/batch_size) + ' (' +str(n_done)+'/' + str(train_size) + ')'
 			logger.info(msg)
 			logger.debug(msg)
 			
@@ -896,7 +982,7 @@ best_epoch = 0.0
 best_F1 = 0.0
 best_model_wts = model.state_dict()
 
-model_name = 'snlp6'
+model_name = 'snlp4'
 def validate():
 	model.eval()
 	valloss_curr_epoch = 0.0
@@ -915,18 +1001,15 @@ def validate():
 		questions_lens = Variable(data[6], volatile = True)
 		span_start = Variable(data[7], volatile=True)
 		span_end = Variable(data[8], volatile=True)
+		final_y = Variable(data[9], volatile=True)
 
-		p1, p2, p1_, p2_ = model(contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens)
-		log_p1 = masked_log_softmax(p1, contexts_mask)
-		log_p2 = masked_log_softmax(p2, contexts_mask)
-
-		loss = F.nll_loss(log_p1, span_start,size_average=False) + F.nll_loss(log_p2, span_end,size_average=False)
-		best_span = _get_best_span(p1.data,p2.data)
-
-		f1,em = get_score(best_span, span_start.data, span_end.data)
+		loss, acc, sum_acc, sum_loss, ans_hat_start_word_idx,ans_hat_end_word_idx = model(contexts, contexts_mask, questions, 
+			questions_mask, contexts_lens, questions_lens, final_y)
+		
+		f1,em = get_score(ans_hat_start_word_idx, ans_hat_end_word_idx , span_start.data, span_end.data)
 		
 		batch_size = questions.size()[0]
-		valloss_curr_epoch += loss.data[0]
+		valloss_curr_epoch += sum_loss.data[0]
 		valF1_curr_epoch += f1
 		valEM_curr_epoch += em
 		
