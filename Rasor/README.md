@@ -6,9 +6,11 @@ This code is our implementation of the paper mentioned in pytorch [Link](http://
 Some boilerplate codes are inspired from the original implementation [Link](https://github.com/shimisalant/RaSoR)
 
 ### Requirements
-pytorch 0.2.0_3 => (if using NYU Prince cluster,  module load pytorch/python3.5/0.2.0_3)
+* Pytorch 0.3.0_4 
 
-numpy/1.13.1 => (if using NYU Prince cluster, module load numpy/python3.5/intel/1.13.1)
+* Python 3.6.3
+
+* Numpy 1.13.1 
 
 
 ### Trained Model
