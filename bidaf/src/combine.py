@@ -524,31 +524,24 @@ class Attention(nn.Module):
 		return X_
 
 def masked_softmax(vector, mask):
-
-	if mask is None:
-		result = torch.nn.functional.softmax(vector, dim=-1)
-	else:
-		# To limit numerical errors from large vector elements outside mask, we zero these out
-		result = torch.nn.functional.softmax(vector * mask, dim=-1)
-		result = result * mask
-		result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
+	result = torch.nn.functional.softmax(vector * mask, dim=-1)
+	result = result * mask
+	result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
 	return result
 
 def masked_log_softmax(vector, mask):
-	if mask is not None:
-		vector = vector + mask.log()
+	vector = vector + mask.log()
 	return torch.nn.functional.log_softmax(vector, dim=1)
 
-def _last_dim_sofmax(tensor, mask= None):
+def _last_dim_sofmax(tensor, mask):
 	tensor_shape = tensor.size()
 	logger.debug(tensor_shape)
 	logger.debug(mask.size())
 	reshaped_tensor = tensor.view(-1, tensor.size()[-1])
-	if mask is not None:
-		while mask.dim() < tensor.dim():
-			mask = mask.unsqueeze(1)
-		mask = mask.expand_as(tensor).contiguous().float()
-		mask = mask.view(-1, mask.size()[-1])
+	while mask.dim() < tensor.dim():
+		mask = mask.unsqueeze(1)
+	mask = mask.expand_as(tensor).contiguous().float()
+	mask = mask.view(-1, mask.size()[-1])
 	reshaped_result = masked_softmax(reshaped_tensor, mask)
 	return reshaped_result.view(*tensor_shape)
 
@@ -704,7 +697,7 @@ class Bidaf(nn.Module):
 			p_end_lin =self.linear_ans_end(self.do(p_level_h_for_end))
 			
 			span_lin_reshaped, span_masks_reshaped = self._span_sums(p_stt_lin, p_end_lin, p_lens, max_p_len, batch_size, self.ff_dims, max_ans_len)
-			span_ff_reshaped = F.relu(span_lin_reshaped)  # (batch_size, max_p_len*max_ans_len, ff_dim)
+			span_ff_reshaped = F.relu(span_lin_reshaped)  
 			span_scores_reshaped = self.linear_span(span_ff_reshaped).squeeze()
 			xents, accs, a_hats = self._span_multinomial_classification(span_scores_reshaped, span_masks_reshaped, anss)
 			loss = xents.mean()
@@ -716,8 +709,6 @@ class Bidaf(nn.Module):
 	def softmax_columns_with_mask(self, x, mask, allow_none=False):
 			assert len(x.size()) == 2
 			assert len(mask.size()) == 2
-			# for numerical stability
-
 			x = x*mask
 			x = x - x.min(dim=0, keepdim=True)[0]
 			x = x*mask
@@ -730,62 +721,54 @@ class Bidaf(nn.Module):
 			return y
 
 	def _span_multinomial_classification(self, x, x_mask, y):
-		# x       float32 (batch_size, num_classes)   scores i.e. logits
-		# x_mask  int32   (batch_size, num_classes)   score masks (each sample has a variable number of classes)
-		# y       int32   (batch_size,)               target classes i.e. ground truth answers (given as class indices)
-		assert len(x.size()) == len(x_mask.size()) == 2
-		assert len(y.size()) == 1
-
-		# substracting min needed since all non masked-out elements of a row may be negative.
 		x = x * x_mask
-		x = x - x.min(dim=0, keepdim=True)[0]  # (batch_size, num_classes)
-		x = x * x_mask  # (batch_size, num_classes)
-		y_hats = x.max(dim=1)[1]  # (batch_size,)
-		accs = torch.eq(y_hats.long(), y.long()).float()  # (batch_size,)
-		x = x - x.max(dim=1, keepdim=True)[0]  # (batch_size, num_classes)
-		x = x * x_mask  # (batch_size, num_classes)
-		exp_x = torch.exp(x)  # (batch_size, num_classes)
-		exp_x = exp_x * x_mask  # (batch_size, num_classes)
+		x = x - x.min(dim=0, keepdim=True)[0]  
+		x = x * x_mask  
+		y_hats = x.max(dim=1)[1]  
+		accs = torch.eq(y_hats.long(), y.long()).float()  
+		x = x - x.max(dim=1, keepdim=True)[0]  
+		x = x * x_mask  
+		exp_x = torch.exp(x)  
+		exp_x = exp_x * x_mask  
 
-		sum_exp_x = exp_x.sum(dim=1)  # (batch_size,)
-		log_sum_exp_x = torch.log(sum_exp_x)  # (batch_size,)
+		sum_exp_x = exp_x.sum(dim=1)  
+		log_sum_exp_x = torch.log(sum_exp_x)  
 		index1 = torch.arange(0,x.size(0)).long()
 		if can_use_gpu:
 			index1 = index1.cuda()
-		x_star = x[index1, y.data]  # (batch_size,)
-		xents = log_sum_exp_x - x_star  # (batch_size,)
+		x_star = x[index1, y.data]  
+		xents = log_sum_exp_x - x_star  
 		return xents, accs, y_hats
 	
 	def _span_sums(self, stt, end, p_lens, max_p_len, batch_size, dim, max_ans_len):
-		max_ans_len_range = torch.arange(0,max_ans_len).unsqueeze(0)  # (1, max_ans_len)
-		offsets = torch.arange(0,max_p_len).unsqueeze(1)  # (max_p_len, 1)
+		max_ans_len_range = torch.arange(0,max_ans_len).unsqueeze(0)  
+		offsets = torch.arange(0,max_p_len).unsqueeze(1)  
 		if can_use_gpu:
 			max_ans_len_range = max_ans_len_range.cuda()
 			offsets = offsets.cuda()
 
-		end_idxs = max_ans_len_range + offsets  # (max_p_len, max_ans_len)
-		end_idxs_flat = end_idxs.view(-1).long()  # (max_p_len*max_ans_len,)
+		end_idxs = max_ans_len_range + offsets  
+		end_idxs_flat = end_idxs.view(-1).long()  
 		extra_zeros = torch.zeros(max_ans_len - 1, batch_size, dim)
 		if can_use_gpu:
 			extra_zeros = extra_zeros.cuda()
-		#print(end.size(), extra_zeros.size())
-		end_padded = torch.cat([end, Variable(extra_zeros)], 0)# (max_p_len+max_ans_len-1, batch_size, dim)
 		
-		end_structured = end_padded[end_idxs_flat]  # (max_p_len*max_ans_len, batch_size, dim)
+		end_padded = torch.cat([end, Variable(extra_zeros)], 0)
 		
-		end_structured = end_structured.view(max_p_len, max_ans_len, batch_size, dim)  # (max_p_len, max_ans_len, batch_size, dim)
-		stt_shuffled = stt.unsqueeze(3).permute(0, 3, 1, 2)  # (max_p_len, 1, batch_size, dim)
+		end_structured = end_padded[end_idxs_flat]  
+		
+		end_structured = end_structured.view(max_p_len, max_ans_len, batch_size, dim)  
+		stt_shuffled = stt.unsqueeze(3).permute(0, 3, 1, 2)  
 
-		span_sums = stt_shuffled + end_structured  # (max_p_len, max_ans_len, batch_size, dim)
-		span_sums_reshaped = span_sums.permute(2, 0, 1, 3).contiguous().view(batch_size, max_p_len * max_ans_len, dim) # (batch_size, max_p_len*max_ans_len, dim)
+		span_sums = stt_shuffled + end_structured  
+		span_sums_reshaped = span_sums.permute(2, 0, 1, 3).contiguous().view(batch_size, max_p_len * max_ans_len, dim)
 
-		p_lens_shuffled = p_lens.unsqueeze(1)  # (batch_size, 1)
-		end_idxs_flat_shuffled = end_idxs_flat.unsqueeze(0)  # (1, max_p_len*max_ans_len)
+		p_lens_shuffled = p_lens.unsqueeze(1)  
+		end_idxs_flat_shuffled = end_idxs_flat.unsqueeze(0)  
 
-		span_masks_reshaped = torch.lt(Variable(end_idxs_flat_shuffled), p_lens_shuffled)  # (batch_size, max_p_len*max_ans_len)
+		span_masks_reshaped = torch.lt(Variable(end_idxs_flat_shuffled), p_lens_shuffled)  
 		span_masks_reshaped = span_masks_reshaped.float()
 
-		# (batch_size, max_p_len*max_ans_len, dim), (batch_size, max_p_len*max_ans_len)
 		return span_sums_reshaped, span_masks_reshaped
 	
 	def forward(self, contexts, contexts_mask, questions, questions_mask, contexts_lens, questions_lens, anss):
@@ -843,7 +826,6 @@ class Bidaf(nn.Module):
 	def softmax_depths_with_mask(self,x, mask):
 		assert len(x.size()) == 3
 		assert len(mask.size()) == 3
-		# for numerical stability
 		x = x*mask
 		x = x - x.min(dim=2, keepdim=True)[0]
 		x = x*mask
@@ -866,8 +848,6 @@ class Bidaf(nn.Module):
 			layer.weight.data.uniform_(-initrange, initrange)
 
 def _get_best_span(span_start_logits, span_end_logits):
-	# if span_start_logits.dim() != 2 or span_end_logits.dim() != 2:
-	# 	raise ValueError("Inp shapes must be (batch_size, passage_length)")
 	batch_size, passage_length = span_start_logits.size()
 	max_span_log_prob = [-1e20] * batch_size
 	span_start_argmax = [0] * batch_size
@@ -876,7 +856,7 @@ def _get_best_span(span_start_logits, span_end_logits):
 	span_start_logits = span_start_logits.cpu().numpy()
 	span_end_logits = span_end_logits.cpu().numpy()
 
-	for b in range(batch_size):  # pylint: disable=invalid-name
+	for b in range(batch_size):  
 		for j in range(passage_length):
 			val1 = span_start_logits[b, span_start_argmax[b]]
 			if val1 < span_start_logits[b, j]:
