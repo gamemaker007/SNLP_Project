@@ -1,20 +1,4 @@
-import torch
-from Model import *
 from Utils import *
-from Settings import  *
-from torch.autograd import Variable
-import logging
-
-logging.basicConfig(filename=log_file_name,level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
-train_data, dev_data, word_emb_data = load_data(tokenized_trn_json_path, tokenized_dev_json_path, batch_size)
-word_emb_tensor = torch.from_numpy(word_emb_data.word_emb)
-
-if can_use_gpu:
-    word_emb_tensor = word_emb_tensor.cuda()
-
-word_emb = Variable(word_emb_tensor)
 
 
 model = QAModel(word_emb, emb_dim, hidden_dim)
@@ -22,6 +6,58 @@ if can_use_gpu:
     model = model.cuda()
 
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+
+def calculate_em_andf1(originals, whitespace, ans_hat_start_word_idx, ans_hat_end_word_idx, ans_text):
+    ems = []
+    f1s = []
+    for i in range(len(originals)):
+        ans_hat_str = construct_answer_hat(originals[i], whitespace[i], ans_hat_start_word_idx[i],
+                                           ans_hat_end_word_idx[i])
+        ems.append(metric_max_over_ground_truths(exact_match_score, ans_hat_str, ans_text[i]))
+        f1s.append(metric_max_over_ground_truths(f1_score, ans_hat_str, ans_text[i]))
+    return ems, f1s
+
+
+def validate_data():
+    loss_curr_epoch = 0.0
+    acc_curr_epoch = 0.0
+    total_ems = 0.0
+    total_f1s = 0.0
+    n_done = 0
+    for data in dev_data:
+        model.eval()
+
+        contexts = Variable(data[0], volatile=True)
+        contexts_mask = Variable(data[1], volatile=True)
+        contexts_lens = Variable(data[5], volatile=True)
+        n_done += contexts_mask.size(1)
+        questions = Variable(data[2], volatile=True)
+        questions_mask = Variable(data[3], volatile=True)
+
+        anss = data[4]
+        ans_text = data[7]
+
+        y = Variable(data[6])
+        originals = data[8]
+        whitespace = data[9]
+        start_span = data[10]
+        end_span = data[11]
+
+        loss, acc, sum_acc, sum_loss, ans_hat_start_word_idx, ans_hat_end_word_idx = model(contexts, contexts_mask,
+                                                                                           questions, questions_mask, y,
+                                                                                           contexts_lens, start_span,
+                                                                                           end_span)
+
+        ems, f1s = calculate_em_andf1(originals, whitespace, ans_hat_start_word_idx, ans_hat_end_word_idx, ans_text)
+
+        loss_curr_epoch += sum_loss.data[0]
+        acc_curr_epoch += acc.data[0]
+        total_ems += sum(ems)
+        total_f1s += sum(f1s)
+
+    return total_ems / n_done, total_f1s / n_done
+
 
 train_loss_hist = []
 train_acc_hist = []
@@ -62,10 +98,13 @@ for epoch in range(max_num_epochs):
         y = Variable(data[6])
         originals = data[8]
         whitespace = data[9]
+        start_span = data[10]
+        end_span = data[11]
 
         loss, acc, sum_acc, sum_loss, ans_hat_start_word_idx, ans_hat_end_word_idx = model(contexts, contexts_mask,
                                                                                            questions, questions_mask, y,
-                                                                                           contexts_lens)
+                                                                                           contexts_lens, start_span,
+                                                                                           end_span)
 
         # em,f1 = calculate_em_andf1(originals, whitespace, ans_hat_start_word_idx, ans_hat_end_word_idx, ans_text)
         del contexts, contexts_mask, contexts_lens, questions, questions_mask

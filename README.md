@@ -1,22 +1,19 @@
 # Stats NLP Project 2017
-Welcome to Stats NLP project on Reading Comprehension by Bhaskar, Karthik and Roshan.
-The project has several dependencies that have to be satisfied before running the code. You can install them using your preferred method -- we list here the names of the packages using `pip`.
 
-# Requirements
+This is our submission for the Statistical Natural Language Processing course [Link](https://cs.nyu.edu/courses/fall17/CSCI-GA.3033-008/) final project.
 
-The starter code provided pressuposes a working installation of Python 2.7, as well as a TensorFlow 0.12.1.
+### Authors
 
-It should also install all needed dependnecies through
-`pip install -r requirements.txt`.
+Bhaskar Gurram, Karthik Venkatesan, Roshan Kumar
 
-# Running the code
 
-You can get started by downloading the datasets and doing dome basic preprocessing:
+### Details
+We have used RaSoR [Link](https://arxiv.org/abs/1611.01436) and BiDAF [Link](https://arxiv.org/abs/1611.01603) model and implemented them in pytorch
 
-$ code/get_started.sh
+### Requirements
 
-Note that you will always want to run your code from the home directory, not the code directory, like so:
+* Python 3.6.3
 
-$ python code/train.py
+* Pytorch 0.3.0_4
 
-This ensures that any files created in the process don't pollute the code directoy.
+* Numpy 1.13.1
