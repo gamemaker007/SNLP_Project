@@ -14,6 +14,11 @@ from torch.autograd import Variable
 import logging
 from typing import Dict, List, Optional, Any, Tuple, Callable
 
+
+#########################
+#   Boiler Plate code   #
+#########################
+
 metadata_path = "../data/preprocessed_glove.metadata.pkl"
 emb_path = "../data/preprocessed_glove.emb.npy"
 tokenized_trn_json_path = '../data/train-v1.1.tokenized.split.json'
@@ -62,7 +67,7 @@ objective = 'span_multinomial'  # 'span_multinomial': multinomial distribution o
 # 'span_endpoints':   two multinomial distributions, over span start and end
 ablation = None
 
-log_file_name = 'snlp_bidaf_log6.out'
+log_file_name = 'snlp_bidaf_log7.out'
 
 
 
@@ -259,8 +264,6 @@ def _contract_word_emb_data(old_word_emb_data, word_strs, is_single_unk):
 def _make_vectorized_dataset(tabular, word_emb_data):
 	num_ctxs = len(tabular.ctxs)
 	num_qtns = len(tabular.qtns)
-	logger.debug(num_ctxs)
-	logger.debug(num_qtns)
 	
 	max_ctx_len = max(len(ctx.tokenized.tokens) for ctx in tabular.ctxs)
 	max_qtn_len = max(len(qtn.tokenized.tokens) for qtn in tabular.qtns)
@@ -426,6 +429,11 @@ if can_use_gpu:
 word_emb = Variable(word_emb_tensor)
 
 
+
+#######################
+# 	START OF BIDAF    #
+#######################
+
 class CharCNN(nn.Module):
 	def __init__(self,emb_dim, num_filters=100, kernel_size=5, out_size=5):
 		super(CharCNN,self).__init__()
@@ -491,29 +499,8 @@ class BiLSTM(nn.Module):
 			elif 'weight' in name:
 				nn.init.uniform(param,-initrange,initrange)
 
-	def forward(self, inp, lens):
-		# batch_size = inp.size()[0]
-		logger.debug('bilstm')
-		logger.debug(inp.size())
-		# sort_inp, sort_lens, sort_idx = sort(inp, lens)
-		# logger.debug(sort_inp.size()) 
-		# packed = nn.utils.rnn.pack_padded_sequence(sort_inp, list(sort_lens.data), batch_first=True)    
-		
+	def forward(self, inp, lens):		
 		output, _ = self.lstm(inp)
-		
-		# unpacked, _ = nn.utils.rnn.pad_packed_sequence(output, batch_first=True)
-		# # get the last time step for each sequence
-		# logger.debug(output.size())
-		# idx = (sort_lens - 1).view(-1, 1).expand(output.size(0), output.size(2)).unsqueeze(1)
-		# decoded = output.gather(1, idx)
-		# # restore the sorting
-		# logger.debug(decoded.size())
-		# _, original_idx = sort_idx.sort(0, descending=True)
-		# unsorted_idx = original_idx.view(-1, 1, 1).expand_as(unpacked)
-		# output = unpacked.gather(0, unsorted_idx.long())
-		logger.debug(output.size())
-		logger.debug('byelstm')
-		# sys.exit()
 		return output
 
 
@@ -528,7 +515,7 @@ class ContextualEmbeddingLayer(nn.Module):
 class HigherContextualEmbeddingLayer(nn.Module):
 	def __init__(self, emb_dim):
 		super(HigherContextualEmbeddingLayer, self).__init__()
-		self.bilstm = BiLSTM(10*emb_dim)
+		self.bilstm = BiLSTM(8*emb_dim)
 
 	def forward(self, A,B, lens):
 		I = torch.cat([A,B],-1)
@@ -551,47 +538,29 @@ class Attention(nn.Module):
 		return X_
 
 def masked_softmax(vector, mask):
-
-	if mask is None:
-		result = torch.nn.functional.softmax(vector, dim=-1)
-	else:
-		# To limit numerical errors from large vector elements outside mask, we zero these out
-		result = torch.nn.functional.softmax(vector * mask, dim=-1)
-		result = result * mask
-		result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
+	result = torch.nn.functional.softmax(vector * mask, dim=-1)
+	result = result * mask
+	result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
 	return result
 
 def masked_log_softmax(vector, mask):
-	if mask is not None:
-		vector = vector + mask.log()
+	vector = vector + mask.log()
 	return torch.nn.functional.log_softmax(vector, dim=1)
 
-def _last_dim_sofmax(tensor, mask= None):
+def _last_dim_sofmax(tensor, mask):
 	tensor_shape = tensor.size()
-	logger.debug(tensor_shape)
-	logger.debug(mask.size())
 	reshaped_tensor = tensor.view(-1, tensor.size()[-1])
-	if mask is not None:
-		while mask.dim() < tensor.dim():
-			mask = mask.unsqueeze(1)
-		mask = mask.expand_as(tensor).contiguous().float()
-		mask = mask.view(-1, mask.size()[-1])
+	while mask.dim() < tensor.dim():
+		mask = mask.unsqueeze(1)
+	mask = mask.expand_as(tensor).contiguous().float()
+	mask = mask.view(-1, mask.size()[-1])
 	reshaped_result = masked_softmax(reshaped_tensor, mask)
 	return reshaped_result.view(*tensor_shape)
 
 def replace_masked_values(tensor, mask, replace_with):
-	if tensor.dim() != mask.dim():
-		raise ConfigurationError("tensor.dim() (%d) != mask.dim() (%d)" % (tensor.dim(), mask.dim()))
 	one_minus_mask = 1.0 - mask
-	logger.debug(tensor.dim())
-	logger.debug(mask.dim())
-	# mask.expand_as(tensor)
-	# one_minus_mask = one_minus_mask.expand_as(tensor)
-	logger.debug(one_minus_mask.size())
 	values_to_add = replace_with * one_minus_mask
-	logger.debug(values_to_add.size())
 	return tensor * mask + values_to_add
-
 
 class C2Q(nn.Module):
 	def __init__(self):
@@ -599,12 +568,7 @@ class C2Q(nn.Module):
 		self.attention = Attention()
   
 	def forward(self,U, S, mask):
-		logger.debug(S.size())	
-		# logger.debug(mask)
-		# sys.exit()
 		S_t = _last_dim_sofmax(S,mask)	 
-		logger.debug(S_t.size())
-		# sys.exit()
 		U_ = self.attention(U, S_t)
 		return U_
 
@@ -614,12 +578,9 @@ class Q2C(nn.Module):
 		super(Q2C, self).__init__()
 		self.attention = Attention()
 
-	def forward(self,H, S, mask):
-		
+	def forward(self,H, S, mask):		
 		N,T,d2 = H.size()
 		S_max = torch.max(S, -1)[0].unsqueeze(-2) # Nx1xT
-		logger.debug(S_max.size())
-		# sys.exit()
 		S_t = _last_dim_sofmax(S_max, mask)
 		H_ = self.attention(H, S_t) # Nx1 x2d
 		H_ = H_.expand(-1,T,-1) # NxTx2d
@@ -657,9 +618,6 @@ class Similarity(nn.Module):
 class BiAttentionLayer(nn.Module):
 	def __init__(self):
 		super(BiAttentionLayer,self).__init__()
-		# self.H = H 
-		# self.U = U
-		
 		self.sim = Similarity(2*100)
 		self.c2q = C2Q()
 		self.q2c = Q2C()
@@ -669,7 +627,6 @@ class BiAttentionLayer(nn.Module):
 		S = self.sim(H, U)	
 		U_ = self.c2q(U, S, q_mask)
 
-		logger.debug(S.size())
 		S_ = replace_masked_values(S,q_mask.unsqueeze(1),-1e7)
 		
 		H_ = self.q2c(H, S_, c_mask)
@@ -714,15 +671,10 @@ class OutputLayer(nn.Module):
 class Bidaf(nn.Module):
 	def __init__(self, word_emb, emb_dim, hidden_size):
 		super(Bidaf, self).__init__()
-		# self.layer1 = EmbeddingLayer()
-		# self.char_emb = nn.Embedding()
-		# self.highwayC = HighwayNetwork(emb_dim, 2)
-		# self.highwayQ = HighwayNetwork(emb_dim, 2)
 		self.highway = HighwayNetwork(emb_dim,2)
-		# self.contextC = ContextualEmbeddingLayer(emb_dim)
-		# self.contextQ = ContextualEmbeddingLayer(emb_dim)
 		self.context = ContextualEmbeddingLayer(emb_dim)
-		self.highercontext = HigherContextualEmbeddingLayer(hidden_size)
+		self.highercontext = ContextualEmbeddingLayer(8*hidden_size)
+		self.highestcontext = ContextualEmbeddingLayer(2*hidden_size)
 		self.biattention = BiAttentionLayer()
 		self.biatt = BiAttentionLayer()
 		self.model = ModelingLayer(hidden_size)
@@ -736,38 +688,25 @@ class Bidaf(nn.Module):
 		n_timesteps_cntx = contexts.size()[1]
 		n_timesteps_quest = questions.size()[1]
 		n_samples = contexts.size()[0]
-		logger.debug('cs')
-		logger.debug(contexts.size())
 		
 		word_emb_cntx = self.word_emb[contexts.view(-1)].view( n_samples,n_timesteps_cntx, emb_dim)
 		word_emb_quest = self.word_emb[questions.view(-1)].view(n_samples,n_timesteps_quest,  emb_dim)	
 		
-		logger.debug('cemb')	
-		logger.debug(word_emb_cntx.size())
-		
-		logger.debug('hw')
 		X = self.highway(word_emb_cntx)		
-		logger.debug(X.size())
 		Q = self.highway(word_emb_quest)
-		logger.debug(Q.size())
-
-		logger.debug('con')
+		
 		H = self.do(self.context(X, contexts_lens))		
-		logger.debug(H.size())
 		U = self.do(self.context(Q, questions_lens))
-		logger.debug(U.size())
-
-		logger.debug('biatt')
+		
 		G = self.biattention(H,U, contexts_mask, questions_mask)
-		logger.debug(G.size())
+		G_dash = self.do(self.highercontext(G,contexts_lens))
 
-		H_hat = self.do(self.highercontext(H,G,contexts_lens))
-		G_hat = self.biatt(H_hat,U,contexts_mask,questions_mask)
+		H_hat = self.do(self.highestcontext(G_dash,contexts_lens))
+		U_hat = self.do(self.highestcontext(U, questions_lens))
 
-		logger.debug('model')
+		G_hat = self.biatt(H_hat,U_hat,contexts_mask,questions_mask)
+
 		M = self.do(self.model(G_hat, contexts_lens))
-		logger.debug(M.size())
-		 
 
 		p1,p2,p1_,p2_ = self.output(G_hat,M, contexts_lens, contexts_mask)
 		
@@ -784,7 +723,7 @@ def _get_best_span(span_start_logits, span_end_logits):
 	span_start_logits = span_start_logits.cpu().numpy()
 	span_end_logits = span_end_logits.cpu().numpy()
 
-	for b in range(batch_size):  # pylint: disable=invalid-name
+	for b in range(batch_size):  
 		for j in range(passage_length):
 			val1 = span_start_logits[b, span_start_argmax[b]]
 			if val1 < span_start_logits[b, j]:
@@ -808,12 +747,7 @@ def get_score(best_span, span_start, span_end):
 		
 		ground = set(list(range(span_start[i],span_end[i]+1)))
 		pred = set(list(range(best_span[i][0], best_span[i][1]+1)))
-		# logger.debug(ground)		
-		# logger.debug(pred)
 		inter = pred & ground
-		# logger.debug('inter')
-		# logger.debug(len(inter))
-		# logger.debug(inter)
 		prec =  len(inter)/len(pred)
 		rec = len(inter)/len(ground)
 		f1=0.0
@@ -886,17 +820,15 @@ def train(epoch):
 		if uidx%100==0:
 			msg = 'uidx = '+str(uidx)+ ' -- Current batch F1 %= '+ str(100.0*f1/batch_size) + ' --  EM = '+ str(100*em/batch_size) + ' --  Loss = '+ str(loss.data[0]/batch_size) + ' (' +str(n_done)+'/' + str(train_size) + ')'
 			logger.info(msg)
-			logger.debug(msg)
 			
 	epoch_msg = 'End of Epoch ' + str(epoch + 1) + '.-- Training F1 %= ' +str(F1_curr_epoch * 100.0/train_size) + ' --  EM = '+ str(100.0*EM_curr_epoch/train_size)+ ' --  Loss = ' + str(loss_curr_epoch/ train_size)
-	logger.debug(epoch_msg)
 	logger.info(epoch_msg)
 
 best_epoch = 0.0
 best_F1 = 0.0
 best_model_wts = model.state_dict()
 
-model_name = 'snlp6'
+model_name = 'snlp7'
 def validate():
 	model.eval()
 	valloss_curr_epoch = 0.0
@@ -930,12 +862,8 @@ def validate():
 		valF1_curr_epoch += f1
 		valEM_curr_epoch += em
 		
-
-		# break
-		
 	epoch_msg = 'End of Epoch ' + str(epoch + 1) + '.-- Validation F1 %= ' +str(valF1_curr_epoch * 100.0/dev_size) + ' --  EM = '+ str(100.0*valEM_curr_epoch/dev_size)+ ' --  Loss = ' + str(valloss_curr_epoch / dev_size)
 	logger.info(epoch_msg)
-	logger.debug(epoch_msg)
 	global best_F1
 	global best_epoch
 	global best_model_wts
@@ -960,9 +888,6 @@ for epoch in range(max_num_epochs):
 	
 	model_file = model_name + '_now' + str(epoch) + '.pth'
 	torch.save(model.state_dict(), model_file)
-
-	# break
-	
 
 model_file = model_name + '_best' + str(epoch) + '.pth'
 torch.save(best_model_wts, model_file)
